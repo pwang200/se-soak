@@ -76,6 +76,24 @@ Cancel). Both patterns implement it: serial loops in-cycle
 (`_finish_until_removed`); pipeline re-Finishes across rounds, tracking
 `finish_attempts` on the in-flight entry.
 
+### accumulate_then_drain (opt-in via a case's accumulate_depth)
+
+A meta-lifecycle for probing what scales with the number of *concurrent live
+smart escrows*, which the steady-state patterns (bounded near one per worker)
+can't reach. Not a new tx sequence: it wraps a case's base lifecycle around a
+burst. Per owner:
+
+  1. accumulate: create N live smart escrows, none drained (N = the case's
+     `accumulate_depth`, override `--accumulate-depth`; realistic hundreds to
+     low thousands).
+  2. drain-Finish: Finish each — this is where the wasm runs at depth, logged
+     with the count still live. finish_removes cases are removed here;
+     cancel_removes cases reject (as their base says) and stay.
+  3. cancel_removes only: wait out CancelAfter, then Cancel each.
+
+Run under `--pattern accumulate` (§4a). A case opts in by setting
+`accumulate_depth`; preflight_reject cases can't (they never create an escrow).
+
 ## 2. Worker and the serial cycle
 
 `Worker` = one funded account + a local sequence cache + Create / Finish /
@@ -159,15 +177,51 @@ at most 3 backstop Cancels, then is dropped with a warning. Validated live
 against a standalone node (all 15 categories, 5 threads × 6 accounts, K=2,
 5065 rows, 0 unexpected) and against an in-process fake xrpld.
 
+## 4a. Accumulate pattern (accumulate_then_drain)
+
+`--pattern accumulate` (`pattern_accumulate.py`) realizes the burst lifecycle
+from §1. Each thread runs one owner at a time through accumulate → drain →
+repeat, round-robin over the accumulate-capable categories. Many threads at
+once also drive the ledger-wide live count, so both the same-owner and
+same-ledger dimensions are exercised.
+
+The binding limit is **owner reserve**, not fee: each live escrow locks
+ReserveIncrement (2 XRP) plus its amount until drained, so peak hold is about
+N × (2 + amount) XRP. At 10,000 XRP funding and amount 1, one owner reaches
+about N=3000. A create that fails mid-ramp (e.g. tecINSUFFICIENT_RESERVE) is
+logged and the reached depth reported, then the burst drains what it has —
+that wall is a result, not a crash.
+
+Measurement and attribution:
+- Every drain Finish is logged to `<run-dir>/accumulate_detail.csv` with the
+  concurrent live count at that point; join tx_hash → WASM_TIMING to see
+  whether per-Finish wasm cost grows with depth.
+- Phase markers (`[accumulate] ... phase=accumulate_start|accumulate_done|
+  drain_start|drain_done`) with timestamps and depth go to run_soak.log, so
+  the memory sampler's RSS splits into ramp, plateau, and drain, distinct from
+  baseline drift.
+
+cancel_removes cases hold a long plateau: they reject at depth (the
+measurement) and stay live until CancelAfter, which is sized to outlast
+accumulate + drain-Finish for all N (a Finish after CancelAfter would fail
+tecNO_PERMISSION). That plateau is where their live-count RSS is observed.
+
+Validated: return_1 (finish_removes) accumulates and drains at N=20 and N=500
+with no wall; its per-Finish time is flat (~50 µs) across live counts 0–500,
+the baseline for heavier cases. return_0 (cancel_removes) rejects at depth then
+Cancels after expiry.
+
 ## 5. Category registry and WASM_TIMING interpretation
 
-Fifteen categories (escrow_lib.CATEGORIES), grouped by lifecycle:
-preflight_reject (A1 unknown_imports, A2 disabled_instructions, A3
-unfunded_account), cancel_removes (return_0, oog_execute, oog_compile,
-trap_div_by_zero), finish_removes (return_1, update_data_then_success,
-trace_heavy, oom_at_max_page, unknown_keylet, boundary_float, many_locals,
+Sixteen categories (escrow_lib.CATEGORIES), grouped by lifecycle:
+preflight_reject (unknown_imports, disabled_instructions, unfunded_account),
+cancel_removes (return_0, oog_execute, oog_compile, trap_div_by_zero),
+finish_removes (return_1, update_data_then_success, trace_heavy,
+oom_at_max_page, unknown_keylet, known_keylet, boundary_float, many_locals,
 home_le_field_bytecode). Each declares its own `gas` allowance; the fee is
-charged on the allowance, not on gas used.
+charged on the allowance, not on gas used. Every non-preflight case also sets
+`accumulate_depth` (§1, §4a), declared centrally in escrow_lib so support and
+default N are in one place.
 
 The D-group (boundary_float, many_locals, home_le_field_bytecode) probes DoS
 shapes where wall time is disproportionate to gas charged (audit findings

@@ -73,6 +73,7 @@ from escrow_lib import (
     get_ledger_fees,
     rpc,
 )
+from pattern_accumulate import AccumulatePattern
 from pattern_pipeline import PipelinePattern
 from pattern_serial import SerialPattern
 
@@ -80,6 +81,7 @@ from pattern_serial import SerialPattern
 PATTERNS: dict[str, type[Pattern]] = {
     SerialPattern.name: SerialPattern,
     PipelinePattern.name: PipelinePattern,
+    AccumulatePattern.name: AccumulatePattern,
 }
 
 
@@ -188,6 +190,10 @@ def main():
                          "Ignored by pipeline pattern.")
     ap.add_argument("--in-flight-per-account", type=int, default=1,
                     help="pipeline: K in-flight escrows per account.")
+    ap.add_argument("--accumulate-depth", type=int, default=None,
+                    help="accumulate: N live escrows to accumulate per owner "
+                         "before draining. Overrides the category's "
+                         "accumulate_depth. Realistic: hundreds to low thousands.")
 
     # Escrow shape.
     ap.add_argument("--amount-xrp", type=int, default=1,
@@ -293,6 +299,12 @@ def main():
         if args.tps is not None:
             print(f"[warn] --tps is ignored by pipeline pattern; cadence is "
                   f"governed by --ledger-interval-s.", file=sys.stderr)
+    elif args.pattern == "accumulate":
+        pattern = AccumulatePattern(
+            depth_override=args.accumulate_depth,
+            detail_path=str(run_dir / "accumulate_detail.csv"),
+            amount_xrp_per_escrow=args.amount_xrp,
+        )
     else:
         sys.exit(f"unknown pattern {args.pattern!r}")
 

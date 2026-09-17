@@ -39,7 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -364,6 +364,15 @@ class Category:
     patches per cycle with data drawn from the ledger indexes. `patch_params`
     passes per-role overrides to the patcher (e.g.
     {"account_id": {"valid_ratio": 0.0}}). Exactly one of wasm/template.
+
+    accumulate_depth: opt-in for the accumulate_then_drain lifecycle
+                      (--pattern accumulate). If set (an int N), the case can
+                      be run as: create N live smart escrows on one owner, then
+                      drain them, to probe cost/allocation that scales with
+                      concurrent live smart-escrow count. None means the case
+                      does not support accumulation (e.g. preflight_reject —
+                      nothing accumulates). The base `lifecycle` still supplies
+                      how each escrow is drained (finish, or finish+cancel).
     """
     name: str
     gas: int
@@ -375,6 +384,7 @@ class Category:
     expected_finish_result: Optional[str] = None
     ephemeral_sender: bool = False
     multi_finish: bool = False
+    accumulate_depth: Optional[int] = None
 
     def __post_init__(self):
         if (self.wasm is None) == (self.template is None):
@@ -386,6 +396,14 @@ class Category:
             raise ValueError(
                 f"{self.name}: ephemeral_sender needs a static wasm"
             )
+        if self.accumulate_depth is not None:
+            if self.accumulate_depth < 1:
+                raise ValueError(f"{self.name}: accumulate_depth must be >= 1")
+            if self.lifecycle == PREFLIGHT_REJECT:
+                raise ValueError(
+                    f"{self.name}: preflight_reject cases never create an "
+                    f"escrow, so they cannot accumulate"
+                )
         if self.lifecycle not in LIFECYCLES:
             raise ValueError(
                 f"{self.name}: unknown lifecycle {self.lifecycle!r}; "
@@ -574,6 +592,27 @@ CATEGORIES: dict[str, Category] = {
 
 
 # ---------------------------------------------------------------------------
+# accumulate_then_drain support (--pattern accumulate)
+#
+# Every finish_removes / cancel_removes case can be accumulated; preflight_reject
+# cases never create an escrow, so they can't. Depth N is the default live count
+# to reach per owner before draining (override at run time with
+# --accumulate-depth). Declared in one place and applied with dataclasses.replace
+# so each case still validates through Category.__post_init__.
+# ---------------------------------------------------------------------------
+
+ACCUMULATE_DEPTH_DEFAULT = 500
+ACCUMULATE_DEPTH_OVERRIDES = {"return_1": 800}   # per-case tuning
+
+CATEGORIES = {
+    name: (replace(cat, accumulate_depth=ACCUMULATE_DEPTH_OVERRIDES.get(
+                name, ACCUMULATE_DEPTH_DEFAULT))
+           if cat.lifecycle != PREFLIGHT_REJECT else cat)
+    for name, cat in CATEGORIES.items()
+}
+
+
+# ---------------------------------------------------------------------------
 # Submit result types
 # ---------------------------------------------------------------------------
 
@@ -717,9 +756,14 @@ class Worker:
     # -- public actions -----------------------------------------------------
 
     def create(self, category: Category, amount_drops: int,
-               open_ledger_fee: int) -> CreateResult:
+               open_ledger_fee: int,
+               cancel_after: Optional[int] = None) -> CreateResult:
         """EscrowCreate { Bytecode, CancelAfter }. CancelAfter is
         mandatory with Bytecode (temBAD_EXPIRATION without it).
+
+        cancel_after (ripple-epoch seconds) may be passed to reuse one value
+        across a burst of creates (the accumulate pattern does this to avoid an
+        RPC per create); default is validated close_time + cancel_after_seconds.
 
         CancelAfter is keyed off xrpld's *ledger close_time*, not the host
         wall-clock. xrpld checks parent_close_time vs CancelAfter at apply
@@ -730,7 +774,8 @@ class Worker:
         if category.ephemeral_sender:
             return self._create_ephemeral(category, amount_drops, open_ledger_fee)
         seq = self._ensure_seq()
-        cancel_after = get_close_time(self.rpc_url) + self.cancel_after_seconds
+        if cancel_after is None:
+            cancel_after = get_close_time(self.rpc_url) + self.cancel_after_seconds
         # Static blob, or a freshly patched template (unique wasm per cycle).
         wasm_bytes = category.make_wasm(self._patch_ctx, self._rng)
         fee = create_fee_drops(open_ledger_fee, len(wasm_bytes))

@@ -327,6 +327,33 @@ TODO (deferred, discuss before implementing):
 - Template + per-cycle wasm patching (Part B) and its patchmap/patcher-role
   vocabulary will be documented here when built.
 
+accumulate_then_drain lifecycle (2026-09-17):
+A burst lifecycle for what scales with concurrent live smart-escrow count,
+which steady-state patterns can't reach. New --pattern accumulate
+(pattern_accumulate.py): per owner, create N live escrows, then drain. N is a
+per-case accumulate_depth (default 500, return_1 800; override
+--accumulate-depth); preflight_reject cases can't accumulate. Support is
+declared centrally in escrow_lib via dataclasses.replace so it is one place to
+read/tune.
+  python3 run_soak.py --pattern accumulate --categories return_1 \
+                      --accumulate-depth 500 --threads N ...
+Drain uses the case's base lifecycle: finish_removes -> Finish each (removed);
+cancel_removes -> Finish each (rejects at depth = the measurement), wait
+CancelAfter, Cancel each. cancel_removes CancelAfter scales with N so a Finish
+never lands after expiry (tecNO_PERMISSION); the pre-expiry gap is a plateau
+holding N live escrows.
+Binding limit is OWNER RESERVE not fee: each live escrow locks 2 XRP
+(ReserveIncrement) + amount until drained, so ~N*(2+amount) XRP at peak;
+10k funding reaches ~N=3000 at amount 1. A create failing mid-ramp
+(tecINSUFFICIENT_RESERVE) is logged and the reached depth reported.
+Attribution: <run-dir>/accumulate_detail.csv logs every create/finish with the
+concurrent live count; join tx_hash -> WASM_TIMING. Phase markers in
+run_soak.log ([accumulate] phase=...) segment sampler RSS into ramp/plateau/
+drain. Additive to populate_ledger baseline; check_state already separates
+Escrow/soak (includes accumulation) from Escrow/baseline and non-escrow types.
+Validated: return_1 N=20 and N=500 (per-Finish time flat ~50us across live
+0-500 = baseline); return_0 rejects at depth then cancels after expiry.
+
 Open question — terQUEUED vs the other three:
 The other three codes (tefPAST_SEQ, terPRE_SEQ, tefMAX_LEDGER) all mean
 "your local seq is wrong, refresh fixes it." terQUEUED is different:
