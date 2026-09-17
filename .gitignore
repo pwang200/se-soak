@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Soak run artifacts and generated accounts (see runs/README.md)
+runs/*
+!runs/README.md
+
+# Personal, per-machine (see CLAUDE.md): permission allowlist stays untracked
+.claude/settings.local.json

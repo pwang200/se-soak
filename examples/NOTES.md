@@ -12,7 +12,9 @@ facts I don't want you to re-derive:
 - probe_escrow_wasm.py
 - probe_escrow_wasm_failures.py
 
-Facts those scripts already established:
+Facts those scripts already established (2026-09-16: the smart-escrow
+branch has since renamed fields/results and changed the Finish fee — see
+"Protocol update" below; the probe scripts still speak the May dialect):
 - Standalone xrpld at http://127.0.0.1:5005/, manual ledger close via
   ledger_accept. Genesis seed snoPBrXtMeMyMHUVTgbuqAfg1SUTb with
   algorithm=secp256k1 → rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh.
@@ -75,3 +77,230 @@ categories beyond return_1/return_0, fancy resilience features.
 
 Start with escrow_lib.py. Show me the structure before filling in
 implementations.
+
+Refine 1:
+Update the Worker class in escrow_lib.py to handle sequence-related
+errors more completely. Reference: xrpl4j's SmartEscrowSoakTest treats
+these engine_results as "sequence errors" that require refreshing the
+local sequence cache from the ledger via account_info:
+
+  tefPAST_SEQ   — submitted sequence is below the account's current
+                  sequence. Tx not applied, sequence not consumed.
+  terPRE_SEQ    — submitted sequence is above current. Tx may queue or
+                  be rejected. Sequence not yet consumed.
+  terQUEUED     — accepted into the TxQ for a future ledger. Sequence
+                  will be consumed when applied.
+  tefMAX_LEDGER — LastLedgerSequence has passed without the tx being
+                  included. Sequence not consumed.
+
+Behavior to add on any of these codes:
+1. Log the engine_result and the worker's cached sequence.
+2. Call account_info to fetch the authoritative sequence and update
+   the cache.
+3. Retry the same operation once with the refreshed sequence.
+4. If it fails again with another sequence error, log and exit
+   non-zero — this is fail-loud, not heroic recovery.
+
+Don't add this to the category functions; it belongs in the lower-level
+submit helper so every Create / Finish / Cancel benefits without
+duplication.
+
+Also add a brief comment block at the top of the submit helper listing
+these four codes and their "is sequence consumed?" semantics, since
+that distinction matters when deciding whether to bump the local
+sequence after the call.
+
+In case you want to see how SmartEscrowSoakTest works: 
+https://github.com/XRPLF/xrpl4j/blob/df/support-smart-escrow/xrpl4j-integration-tests/src/test/java/org/xrpl/xrpl4j/tests/SmartEscrowSoakTest.java
+
+Refine 2:
+Scheduling is now an abstraction. Three concerns are decoupled:
+
+- Worker  (escrow_lib.py): one account's primitives — Create/Finish/Cancel
+  + sequence cache. Never changes when we add patterns or categories.
+- Category (escrow_lib.py CATEGORIES): one wasm test case — blob, gas
+  allowance, expected finish result, cleanup strategy. Adding a new
+  category = one row.
+- Pattern (pattern_*.py): *when* to submit *what* across a slice of
+  accounts. Adding a new pattern = one new module subclassing
+  escrow_lib.Pattern. Selected at runtime with --pattern.
+
+Two patterns are shipped:
+
+- SerialPattern (--pattern serial). One thread per account; one cycle
+  at a time (Create → wait → cleanup → wait). Today's behavior.
+  In-flight bound: ≤ threads.
+
+- PipelinePattern (--pattern pipeline). Each thread owns M accounts
+  (--accounts-per-thread) and runs round-driven submission. Per round
+  (one ledger close):
+    A. validate the previous round's pending submits (CSV-log them).
+    B. submit Finish/Cancel for every in-flight escrow that's ready.
+    C. top up with new Creates until each account has K in-flight
+       (--in-flight-per-account; default 1).
+    D. wait for the round's last submit hash to validate.
+    E. backstop sweep: force-Cancel any CREATED entry past CancelAfter.
+  Create and its Finish are always in different ledgers. No same-ledger
+  trickery (option A from the design discussion was rejected).
+  In-flight bound: ≤ threads × accounts_per_thread × K.
+
+Backstop (both patterns):
+Every escrow has a CancelAfter (default 30s). If the happy-path cleanup
+doesn't validate as expected, the escrow is parked. At the next sweep,
+anything past CancelAfter + 2s grace is Cancelled. This is what keeps
+in-flight count bounded across a week-long soak even if some Finishes
+behave unexpectedly. Logged as action="cancel_backstop" in the CSV.
+
+CSV columns are now:
+    ts, thread_id, account, category, action,
+    tx_hash, engine_result, final_result
+("worker_id" was renamed to "thread_id"; "account" was added so rows from
+the same thread driving multiple accounts can be disambiguated.)
+
+Adding a new wasm category: append to CATEGORIES with name, wasm blob,
+computation_allowance, expected_finish_result, cleanup ("finish" or
+"cancel"). Both patterns pick it up automatically.
+
+Adding a new pattern: write pattern_<name>.py with a subclass of
+escrow_lib.Pattern, register it in PATTERNS in run_soak.py.
+
+Refine 3 (lifecycles):
+`cleanup` on Category is replaced by `lifecycle`, and a third lifecycle is
+added. Each category now declares what it expects at every step:
+
+  finish_removes    Create(tes) → Finish(tes; removes escrow) → done.
+  cancel_removes    Create(tes) → Finish(tecWASM_REJECTED; escrow stays)
+                    → wait CancelAfter → Cancel(tes) → done.
+  preflight_reject  Create rejected at preflight (expected_create_result
+                    is the tem* code). No escrow, no Finish, no Cancel.
+
+Fields: lifecycle, expected_create_result (default tesSUCCESS),
+expected_finish_result (None for preflight_reject). Category.__post_init__
+rejects inconsistent combinations.
+
+Behaviour change for return_0: it now submits the Finish (expected
+tecWASM_REJECTED) before waiting for CancelAfter. Before this, cancel
+categories never ran their wasm at all — no WASM_TIMING_FINISH lines,
+no reject-path coverage. One extra tx per return_0 cycle.
+
+Unexpected outcomes (actual ≠ declared) print an "[unexpected] ..." line
+to stderr in addition to the CSV row. Not fatal. Anything that leaves an
+escrow on the ledger against expectation — Finish that didn't remove it,
+Cancel that failed, a preflight_reject Create that xrpld accepted — is
+backstop-Cancelled after CancelAfter, so the in-flight bound holds even
+when xrpld misbehaves.
+
+submit_and_log now waits for validation on tec* results too (they are
+applied and validate), so cancel_removes Finish rows carry the validated
+meta result instead of an empty final_result.
+
+Pipeline pattern fixes made while adding the lifecycle branches (the
+pattern had never been run):
+- PENDING_CLEANUP entries were removed from the queue regardless of
+  result, so the stage-E backstop could never see a failed cleanup. Now a
+  non-removing result goes to STRANDED and stage E Cancels it.
+- Stage D waited on the last submitted hash even when that submit was not
+  applied (tel/tef), which would time out and abort the soak. Now only
+  applied (tes/tec) hashes are tracked.
+- Category rotation is per Create (per-account cursor), not per round, so
+  preflight_reject Creates take a rotation slot but no in-flight slot and
+  the account still fills its K real escrows. Loop bounded at K + #cats.
+- New states: PENDING_FINISH, AWAIT_CANCEL (cancel_removes waiting out
+  CancelAfter), STRANDED, PENDING_CANCEL. tecNO_TARGET on a Cancel counts
+  as "escrow gone". MAX_BACKSTOP_ATTEMPTS=3 then drop with a warning.
+
+Protocol update (2026-09-16, xrpld 3.4.0-rc1 @ e3027675a4, branch se-soak):
+The first dry run against the rebuilt node aborted with
+"Field 'tx_json.FinishFunction' is unknown". Read from the source:
+- EscrowCreate: `FinishFunction` → `Bytecode` (Blob). CancelAfter still
+  required (temBAD_EXPIRATION). Fee unchanged: 10*base + 5*bytes. Size
+  capped by FeeSettings.BytecodeSizeLimit (temMALFORMED above it).
+- EscrowFinish: `ComputationAllowance` → `Gas` (UInt32). Mandatory when the
+  escrow has Bytecode (tefBYTECODE_NOT_INCLUDED), forbidden otherwise
+  (tefNO_BYTECODE). 1 <= Gas <= FeeSettings.GasLimit else temBAD_LIMIT.
+  Fee = base + Gas*GasPrice/1e6 + 1 (GasPrice in micro-drops per gas,
+  from FeeSettings). Was: base*100 + allowance.
+- Results: tecWASM_REJECTED → tecBYTECODE_REJECTED (202, wasm returned
+  <= 0; return value lands in meta VMReturnCode). New: tecOUT_OF_GAS (201),
+  temINVALID_BYTECODE. GasLimit == 0 or BytecodeSizeLimit == 0 in
+  FeeSettings → temTEMP_DISABLED ("WASM runtime deactivated by fee voting").
+- Wasm entry point renamed: the module must export `escrow_finish`
+  (`() -> i32`), not `finish`; otherwise EscrowCreate fails at preflight
+  with temINVALID_BYTECODE and the log says "no entry point
+  'escrow_finish'". Imports must come from module `host_lib`. Both
+  wats/*.wat updated (now 46 bytes each).
+- Observed on the unfixed node (SmartEscrow NOT enabled): EscrowCreate
+  with Bytecode returned temINVALID_BYTECODE, i.e. the wasm validator ran
+  before the amendment gate refused the tx. Worth a look on the xrpld side.
+- FeeSettings gained GasLimit=1,000,000 / GasPrice=1,000,000 /
+  BytecodeSizeLimit=100,000 at ledger 257 (first flag ledger), not at
+  genesis, on that node. A freshly started node has none for ~17 min at
+  4 s ledgers unless genesis seeds them.
+- WASM_TIMING_FINISH `result=` is now the wasm return value on success or
+  the tec name on reject/failure; `gas=` is the engine's cost.
+- Server-side signing (`submit` + `secret`) still works, with a
+  "deprecated" note in the response. xrpl-py 4.5.0 has no Bytecode/Gas.
+- Driver: escrow_lib.get_ledger_fees reads gas_limit/gas_price/
+  bytecode_size_limit from `server_state`.state.validated_ledger at startup
+  (FeeSettings ledger_entry as fallback) and fails loud if neither has
+  them; Category.computation_allowance → Category.gas.
+- Gas sizing rule (2026-09-16): allowance >= 10x measured `gas=` from
+  WASM_TIMING_FINISH. return_1/return_0 measure 30 -> gas=1_000 (Finish fee
+  1,011 drops instead of 10,011 at gas=10_000; the dry run of 20:37 UTC ran
+  with 10_000).
+- Node rebuilt at 38f99136af with PR 8228 (fee limits from the ledger; fixes
+  the "no gas fields until the first flag ledger" issue). With
+  [features]-only config FeeSettings still has no gas fields — the values
+  are protocol defaults surfaced via server_state. `feature` RPC keeps
+  saying enabled:false; that is expected in standalone.
+- Node side (separate fix in xrpld): with `[features] SmartEscrow` the
+  rebuilt node still came up with SmartEscrow vetoed and no gas fields in
+  FeeSettings.
+
+All-categories build (2026-09-16, live against xrpld 3.4.0-rc1 @ 33b530ab):
+15 categories registered. Live end-to-end confirmed 13; 2 open findings.
+- Confirmed create/finish codes (locked in the registry):
+    unknown_imports, disabled_instructions -> temINVALID_BYTECODE
+    unfunded_account -> terNO_ACCOUNT
+    oog_execute -> tecOUT_OF_GAS (not tecFAILED_PROCESSING; probe 5 predated
+      the tecOUT_OF_GAS code)
+    trap_div_by_zero -> tecFAILED_PROCESSING
+    return_0 -> tecBYTECODE_REJECTED; return_1 / trace_heavy / oom_at_max_page
+      / unknown_keylet / boundary_float / many_locals / home_le_field_bytecode
+      -> tesSUCCESS
+- trace_heavy: 5000 trace calls cost ~225k gas (~45 gas/call; trace is NOT
+  free), so its allowance is 300000 not 200000.
+- A3 unfunded_account needs CLIENT-side signing: server-side submit+secret
+  fails srcActNotFound for a nonexistent account. escrow_lib injects Bytecode
+  (nth47 Blob) / Gas (nth84 UInt32) into xrpl-py's codec and submits a signed
+  tx_blob. That is the sole use of client-side signing; pool accounts still
+  sign server-side.
+- multi_finish: finish_removes categories may retry Finish while the wasm
+  rejects, capped at MAX_FINISH_ATTEMPTS=4 (for update_data_then_success).
+- oog_compile: RESOLVED. Wasmi LazyTranslation only translates CALLED
+  functions; the uncalled noise cost nothing (gas=30). escrow_finish now calls
+  all noise fns (early return + dead body) -> tecOUT_OF_GAS with gas=0, i.e.
+  runs out in TRANSLATION before executing. gas=0 distinguishes translation-OOG
+  (B3) from execution-OOG (B2). update_data_then_success:
+  RESOLVED. home_le_field takes the FULL SField code (type<<16)|nth, not the
+  bare nth (invokeWithField -> SField::getKnownCodeToField). sfData is
+  (7<<16)|27=458779, not 27; with 27 it never matched so every Finish rejected.
+  Fixed -> converges in 2 Finishes. Same fix for home_le_field_bytecode
+  (sfBytecode (7<<16)|47=458799). All 15 categories now behave as intended.
+
+Open question — terQUEUED vs the other three:
+The other three codes (tefPAST_SEQ, terPRE_SEQ, tefMAX_LEDGER) all mean
+"your local seq is wrong, refresh fixes it." terQUEUED is different:
+the seq is fine, but the fee was below open_ledger_fee and xrpld parked
+the tx in the TxQ. Refreshing from account_info doesn't help — the
+queued tx hasn't applied, so account_info returns the same seq we
+already used. A retry would resubmit with the same seq + same fee and
+either hit terQUEUED again or tefPAST_SEQ (if the queued copy applied
+first), tripping the fail-loud exit on the second attempt.
+
+At soak load with open_ledger_fee jumping, terQUEUED is the most likely
+"sequence-class" error to actually hit, and the correct response is
+"bump fee and retry," not "refresh seq." Current behavior treats it the
+same as the other three → fail-loud exit on the second hit, which is
+the operator's signal to raise fee headroom. Acceptable for now;
+revisit if we see terQUEUED churn during real runs.

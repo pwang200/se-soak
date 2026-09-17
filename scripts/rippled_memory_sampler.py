@@ -121,7 +121,8 @@ def main():
     ap.add_argument(
         "--output",
         default=None,
-        help="Output CSV path (default: xrpld_memory_<utc>.csv in cwd)",
+        help="Output CSV path (default: <project>/runs/xrpld_memory_<utc>.csv; "
+             "pass <run-dir>/xrpld_memory.csv to group with a soak run)",
     )
     ap.add_argument(
         "--rpc-url",
@@ -143,7 +144,10 @@ def main():
 
     if args.output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        args.output = f"xrpld_memory_{stamp}.csv"
+        runs_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), os.pardir, "runs"))
+        args.output = os.path.join(runs_dir, f"xrpld_memory_{stamp}.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
 
     # Append mode: safe across sampler restarts. Write header only if new file.
     new_file = (not os.path.exists(args.output)) or os.path.getsize(args.output) == 0
