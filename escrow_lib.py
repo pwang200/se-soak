@@ -44,7 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from escrow_patch import PatchContext, Template
+from escrow_patch import PatchContext, Template, load_template
 
 
 # ---------------------------------------------------------------------------
@@ -534,6 +534,18 @@ CATEGORIES: dict[str, Category] = {
         wasm=load_wasm("unknown_keylet.wasm"),
         gas=6_000,
         lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    # Template partner to unknown_keylet: same keylet_probe module, but patched
+    # each cycle with a REAL pool account, so cache_le loads an actual
+    # AccountRoot (the expensive path) rather than missing. Compare its
+    # WASM_TIMING against unknown_keylet's not-found path.
+    "known_keylet": Category(
+        name="known_keylet",
+        gas=6_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("keylet_probe"),
+        patch_params={"account_id": {"valid_ratio": 1.0}},
         expected_finish_result="tesSUCCESS",
     ),
     # -- D: DoS-shaped finish-removes (time disproportionate to gas) --------
