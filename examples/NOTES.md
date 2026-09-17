@@ -288,6 +288,45 @@ All-categories build (2026-09-16, live against xrpld 3.4.0-rc1 @ 33b530ab):
   Fixed -> converges in 2 Finishes. Same fix for home_le_field_bytecode
   (sfBytecode (7<<16)|47=458799). All 15 categories now behave as intended.
 
+Ledger population (populate_ledger.py, 2026-09-17, Part A of the audit-guided
+DoS work):
+Runs after setup_accounts, before run_soak. Uses the funded pool accounts as
+actors to create seven object types with randomized parameters, round-robin
+across owners: trustlines (RippleState), offers (Offer), nftokens (NFTokenPage),
+mpts (MPTokenIssuance), escrows (plain, CancelAfter +1yr so they never vanish
+mid-soak), oracles (Oracle), credentials (Credential). All seven confirmed
+creatable on the standalone node once the amendments are in [features]
+(NonFungibleTokensV1_1, MPTokensV1, PriceOracle, Credentials, plus Escrow /
+SmartEscrow) — the feature RPC still reports them "disabled" but the transactors
+work, same preset behaviour as SmartEscrow.
+  python3 populate_ledger.py --count-per-type 50           # dev
+  python3 populate_ledger.py --count-per-type 140000       # ~1M total
+Output: one JSON index per type in populated/ (gitignored). Each record has the
+ingredients to recompute the keylet AND the node's real keylet in `index`, read
+from the tx meta CreatedNode (NFTs: the NFTokenPage keylet + nft_id) — no
+client-side keylet math. Idempotent: a non-empty populated/ makes it print
+counts and exit; delete the dir for a fresh start. Fail-loud on any non-tes
+submit or missing keylet.
+
+Pool-account object convention + check_state:
+A pool account owns two flavours of object: populated baseline (constant across
+a soak; escrows use CancelAfter ~1yr) and in-flight soak escrows (CancelAfter
+~30s, removed within a cycle). check_state.py buckets every account_objects
+entry by LedgerEntryType, splits Escrow into Escrow/baseline vs Escrow/soak by
+CancelAfter (cutoff now+30 days), and DEDUPES by keylet because shared objects
+(RippleState, an owner->dest Escrow, a Credential) appear in both parties'
+account_objects. With populated/ present it prints expected-vs-ledger per type
+and flags a baseline DROP (missing) as drift.
+
+TODO (deferred, discuss before implementing):
+- Cat 6 (cache_le storm): template model, mix of valid keylets from populated
+  indexes + fabricated invalid ones. Discuss merging with C5 first.
+- Random-field-code categories: need a way to enumerate valid field codes per
+  object type; naive random codes hit FieldNotFound ~always and measure the
+  wrong path.
+- Template + per-cycle wasm patching (Part B) and its patchmap/patcher-role
+  vocabulary will be documented here when built.
+
 Open question — terQUEUED vs the other three:
 The other three codes (tefPAST_SEQ, terPRE_SEQ, tefMAX_LEDGER) all mean
 "your local seq is wrong, refresh fixes it." terQUEUED is different:

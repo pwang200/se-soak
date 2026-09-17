@@ -223,3 +223,6 @@ runs/*
 
 # Personal, per-machine (see CLAUDE.md): permission allowlist stays untracked
 .claude/settings.local.json
+
+# Populated ledger indexes (data, regenerate with populate_ledger.py)
+populated/
