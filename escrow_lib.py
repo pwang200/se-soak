@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import csv
 import json
+import random
 import sys
 import threading
 import time
@@ -42,6 +43,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
+
+from escrow_patch import PatchContext, Template
 
 
 # ---------------------------------------------------------------------------
@@ -270,8 +273,8 @@ def check_categories_against_fees(categories, fees: LedgerFees) -> None:
     for c in categories:
         if c.runs_finish and not (1 <= c.gas <= fees.gas_limit):
             problems.append(f"{c.name}: gas={c.gas} outside 1..{fees.gas_limit}")
-        if len(c.wasm) > fees.bytecode_size_limit:
-            problems.append(f"{c.name}: wasm {len(c.wasm)} bytes > "
+        if c.wasm_size > fees.bytecode_size_limit:
+            problems.append(f"{c.name}: wasm {c.wasm_size} bytes > "
                             f"BytecodeSizeLimit {fees.bytecode_size_limit}")
     if problems:
         raise ValueError("; ".join(problems))
@@ -355,17 +358,34 @@ class Category:
                             finish succeeds. expected_finish_result is the
                             TERMINAL result (tesSUCCESS); intermediate
                             tecBYTECODE_REJECTED is expected by construction.
+
+    wasm vs template: a category ships EITHER a static `wasm` blob (fixed for
+    every cycle) OR a `template` (escrow_patch.Template) that the driver
+    patches per cycle with data drawn from the ledger indexes. `patch_params`
+    passes per-role overrides to the patcher (e.g.
+    {"account_id": {"valid_ratio": 0.0}}). Exactly one of wasm/template.
     """
     name: str
-    wasm: bytes
     gas: int
     lifecycle: str
+    wasm: Optional[bytes] = None
+    template: Optional[Template] = None
+    patch_params: dict = field(default_factory=dict)
     expected_create_result: str = "tesSUCCESS"
     expected_finish_result: Optional[str] = None
     ephemeral_sender: bool = False
     multi_finish: bool = False
 
     def __post_init__(self):
+        if (self.wasm is None) == (self.template is None):
+            raise ValueError(
+                f"{self.name}: set exactly one of wasm= (static) or "
+                f"template= (patched per cycle)"
+            )
+        if self.ephemeral_sender and self.wasm is None:
+            raise ValueError(
+                f"{self.name}: ephemeral_sender needs a static wasm"
+            )
         if self.lifecycle not in LIFECYCLES:
             raise ValueError(
                 f"{self.name}: unknown lifecycle {self.lifecycle!r}; "
@@ -400,6 +420,25 @@ class Category:
     @property
     def runs_finish(self) -> bool:
         return self.lifecycle in (FINISH_REMOVES, CANCEL_REMOVES)
+
+    @property
+    def wasm_size(self) -> int:
+        """Byte length of the Bytecode field (drives the EscrowCreate fee).
+        Constant for template categories — a patch never changes length."""
+        return len(self.wasm) if self.wasm is not None else len(self.template.body)
+
+    def make_wasm(self, patch_ctx: Optional[PatchContext],
+                  rng: random.Random) -> bytes:
+        """The Bytecode bytes for one EscrowCreate: the static blob, or a
+        freshly patched template."""
+        if self.wasm is not None:
+            return self.wasm
+        if patch_ctx is None:
+            raise RuntimeError(
+                f"{self.name}: template category needs a PatchContext "
+                f"(run_soak passes one; did populate_ledger.py run?)"
+            )
+        return patch_ctx.patch(self.template, rng, self.patch_params)
 
 
 # EscrowFinish attempts before a multi_finish category is declared stranded.
@@ -560,12 +599,16 @@ class Worker:
 
     def __init__(self, rpc_url: str, address: str, seed: str,
                  cancel_after_seconds: int = 30,
-                 fees: Optional[LedgerFees] = None):
+                 fees: Optional[LedgerFees] = None,
+                 patch_ctx: Optional[PatchContext] = None):
         self.rpc_url = rpc_url
         self.address = address
         self.seed = seed
         self.cancel_after_seconds = cancel_after_seconds
         self._fees = fees
+        self._patch_ctx = patch_ctx
+        # Own rng per worker: template patching is thread-local, no shared state.
+        self._rng = random.Random()
         self._seq: Optional[int] = None
         # Workers are intended to be owned by one thread, but guard anyway.
         self._lock = threading.Lock()
@@ -676,13 +719,15 @@ class Worker:
             return self._create_ephemeral(category, amount_drops, open_ledger_fee)
         seq = self._ensure_seq()
         cancel_after = get_close_time(self.rpc_url) + self.cancel_after_seconds
-        fee = create_fee_drops(open_ledger_fee, len(category.wasm))
+        # Static blob, or a freshly patched template (unique wasm per cycle).
+        wasm_bytes = category.make_wasm(self._patch_ctx, self._rng)
+        fee = create_fee_drops(open_ledger_fee, len(wasm_bytes))
         tx = {
             "TransactionType": "EscrowCreate",
             "Account": self.address,
             "Destination": self.address,
             "Amount": str(amount_drops),
-            "Bytecode": category.wasm.hex().upper(),
+            "Bytecode": wasm_bytes.hex().upper(),
             "CancelAfter": cancel_after,
             "Sequence": seq,
             "Fee": str(fee),

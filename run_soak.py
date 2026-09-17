@@ -59,6 +59,7 @@ from pathlib import Path
 
 from xrpl.utils import xrp_to_drops
 
+from escrow_patch import PatchContext
 from escrow_lib import (
     CATEGORIES,
     DEFAULT_ACCOUNTS_FILE,
@@ -256,9 +257,16 @@ def main():
     except ValueError as e:
         sys.exit(f"[fail] category vs FeeSettings: {e}")
 
+    # Template categories patch a wasm template per cycle from ledger indexes;
+    # load the shared PatchContext only when one is actually selected (it can
+    # be large at scale).
+    needs_patch = any(c.template is not None for c in categories)
+    patch_ctx = PatchContext.load(args.accounts) if needs_patch else None
+
     workers = [
         Worker(args.rpc_url, e["address"], e["seed"],
-               cancel_after_seconds=args.cancel_after_s, fees=fees)
+               cancel_after_seconds=args.cancel_after_s, fees=fees,
+               patch_ctx=patch_ctx)
         for e in entries[:total_active]
     ]
     chunks = partition_accounts(workers, args.accounts_per_thread)

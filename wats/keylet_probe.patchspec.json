@@ -1,0 +1,10 @@
+{
+  "template": "keylet_probe",
+  "slots": [
+    {
+      "name": "account",
+      "sentinel": "5EA7C0DE00112233445566778899AABBCCDDEEFF",
+      "role": "account_id"
+    }
+  ]
+}

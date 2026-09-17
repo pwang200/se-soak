@@ -1,0 +1,13 @@
+{
+  "template": "keylet_probe",
+  "length": 172,
+  "slots": [
+    {
+      "name": "account",
+      "offset": 152,
+      "length": 20,
+      "role": "account_id",
+      "params": {}
+    }
+  ]
+}

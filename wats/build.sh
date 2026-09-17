@@ -35,5 +35,9 @@ for wat in "${wats[@]}"; do
     # No --debug-names: a name section would change the byte size (and so
     # the EscrowCreate fee) without changing behaviour.
     wat2wasm "$wat" -o "$wasm"
-    printf '%-22s -> %-22s %5d bytes\n' "$wat" "$wasm" "$(wc -c < "$wasm")"
+    printf '%-26s -> %-26s %5d bytes\n' "$wat" "$wasm" "$(wc -c < "$wasm")"
 done
+
+# Template categories: locate patch sentinels in the compiled .wasm and emit
+# <name>.wasm.patchmap. No-op if there are no .patchspec.json files.
+python3 build_patchmaps.py
