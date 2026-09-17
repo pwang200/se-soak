@@ -104,12 +104,51 @@ class PatchContext:
                             rng: random.Random) -> bytes:
         return rng.randbytes(slot["length"])
 
+    def _role_u32_count(self, slot: dict, params: dict,
+                        rng: random.Random) -> bytes:
+        """4-byte little-endian iteration count (params['iterations'])."""
+        return int(params["iterations"]).to_bytes(4, "little")
+
+    def _role_account_id_array(self, slot: dict, params: dict,
+                               rng: random.Random) -> bytes:
+        """The account-id array for cache_le_pattern. Fills the first
+        `iterations` 20-byte entries with a shuffled hit/miss mix — hits are
+        DISTINCT real accounts (cache_le finds them), misses are random ids
+        (not found) — so all keys in one Finish are distinct. The rest of the
+        fixed-capacity slot is zero filler (the wasm only reads `iterations`
+        entries). Distinctness across Finishes comes from independent random
+        draws against a large account pool; a small pool warms the cache and
+        won't reach disk (see NOTES)."""
+        iterations = int(params["iterations"])
+        hit_ratio = params.get("hit_ratio", 0.0)
+        cap = slot["length"] // 20
+        if iterations > cap:
+            raise RuntimeError(
+                f"cache_le_pattern: iterations {iterations} exceeds template "
+                f"capacity {cap}; regenerate the template with a larger MAX_N")
+        n_hits = round(iterations * hit_ratio)
+        if n_hits and not self.account_ids:
+            raise RuntimeError("hit_ratio>0 but no pool accounts loaded")
+        if n_hits <= len(self.account_ids):
+            hits = rng.sample(self.account_ids, n_hits)          # distinct
+        else:
+            hits = [rng.choice(self.account_ids) for _ in range(n_hits)]
+        misses = [rng.randbytes(20) for _ in range(iterations - n_hits)]
+        entries = hits + misses
+        rng.shuffle(entries)                                     # random order
+        out = bytearray(slot["length"])                         # zero-filled
+        for i, e in enumerate(entries):
+            out[i * 20:i * 20 + 20] = e
+        return bytes(out)
+
     @property
     def _roles(self) -> dict[str, Callable]:
         return {
             "account_id": self._role_account_id,
             "keylet": self._role_keylet,
             "opaque_random": self._role_opaque_random,
+            "u32_count": self._role_u32_count,
+            "account_id_array": self._role_account_id_array,
         }
 
     # ----- patch -----
@@ -117,8 +156,10 @@ class PatchContext:
     def patch(self, template: Template, rng: random.Random,
               category_params: Optional[dict] = None) -> bytes:
         """Return a fresh wasm blob: template.body with every slot rewritten.
-        category_params maps a role name to overrides merged over the slot's
-        own params (e.g. {"account_id": {"valid_ratio": 0.0}})."""
+        category_params is a flat dict of parameters available to every slot's
+        role handler, merged over the slot's own defaults (e.g.
+        {"valid_ratio": 0.0} or {"iterations": 150, "hit_ratio": 0.5}). Each
+        handler reads the keys it needs."""
         category_params = category_params or {}
         buf = bytearray(template.body)
         for slot in template.slots:
@@ -126,7 +167,7 @@ class PatchContext:
             handler = self._roles.get(role)
             if handler is None:
                 raise RuntimeError(f"{template.name}: unknown patch role {role!r}")
-            params = {**slot.get("params", {}), **category_params.get(role, {})}
+            params = {**slot.get("params", {}), **category_params}
             data = handler(slot, params, rng)
             if len(data) != slot["length"]:
                 raise RuntimeError(

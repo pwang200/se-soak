@@ -37,10 +37,14 @@ def build_one(spec_path: Path) -> str:
             raise SystemExit(f"{name}: sentinel for slot {s['name']!r} not found in wasm")
         if wasm.find(sentinel, first + 1) >= 0:
             raise SystemExit(f"{name}: sentinel for slot {s['name']!r} appears more than once")
+        # A slot may patch a region larger than its locating sentinel (e.g. a
+        # fixed-capacity array whose first bytes are the sentinel); declare it
+        # with "length". Default is the sentinel's own length.
+        length = s.get("length", len(sentinel))
         slots.append({
             "name": s["name"],
             "offset": first,
-            "length": len(sentinel),
+            "length": length,
             "role": s["role"],
             "params": s.get("params", {}),
         })

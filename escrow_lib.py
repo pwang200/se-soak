@@ -547,23 +547,62 @@ CATEGORIES: dict[str, Category] = {
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
-    "unknown_keylet": Category(
-        name="unknown_keylet",
-        wasm=load_wasm("unknown_keylet.wasm"),
-        gas=6_000,
-        lifecycle=FINISH_REMOVES,
-        expected_finish_result="tesSUCCESS",
-    ),
-    # Template partner to unknown_keylet: same keylet_probe module, but patched
-    # each cycle with a REAL pool account, so cache_le loads an actual
-    # AccountRoot (the expensive path) rather than missing. Compare its
-    # WASM_TIMING against unknown_keylet's not-found path.
+    # Single valid cache_le on a real pool account (loads an actual AccountRoot).
+    # Retained; the cache_le_pattern _single presets cover the same shape with
+    # the patched-array mechanism. (Old unknown_keylet retired — its miss path
+    # is now cache_miss_single.)
     "known_keylet": Category(
         name="known_keylet",
         gas=6_000,
         lifecycle=FINISH_REMOVES,
         template=load_template("keylet_probe"),
-        patch_params={"account_id": {"valid_ratio": 1.0}},
+        patch_params={"valid_ratio": 1.0},
+        expected_finish_result="tesSUCCESS",
+    ),
+    # cache_le_pattern family: one template, five presets differing only in
+    # iteration count and hit/miss ratio. Each Finish loops cache_le over
+    # distinct keys (fresh reads); the storms probe whether per-call wall time
+    # scales with gas and whether hit vs miss is disproportionate. Storm gas
+    # ~150 * 5350 + overhead, under the 1M GasLimit. The two _single presets
+    # subsume the old unknown_keylet.
+    "cache_miss_single": Category(
+        name="cache_miss_single",
+        gas=8_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("cache_le_pattern"),
+        patch_params={"iterations": 1, "hit_ratio": 0.0},
+        expected_finish_result="tesSUCCESS",
+    ),
+    "cache_hit_single": Category(
+        name="cache_hit_single",
+        gas=8_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("cache_le_pattern"),
+        patch_params={"iterations": 1, "hit_ratio": 1.0},
+        expected_finish_result="tesSUCCESS",
+    ),
+    "cache_miss_storm": Category(
+        name="cache_miss_storm",
+        gas=900_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("cache_le_pattern"),
+        patch_params={"iterations": 150, "hit_ratio": 0.0},
+        expected_finish_result="tesSUCCESS",
+    ),
+    "cache_hit_storm": Category(
+        name="cache_hit_storm",
+        gas=900_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("cache_le_pattern"),
+        patch_params={"iterations": 150, "hit_ratio": 1.0},
+        expected_finish_result="tesSUCCESS",
+    ),
+    "cache_mixed_storm": Category(
+        name="cache_mixed_storm",
+        gas=900_000,
+        lifecycle=FINISH_REMOVES,
+        template=load_template("cache_le_pattern"),
+        patch_params={"iterations": 150, "hit_ratio": 0.5},
         expected_finish_result="tesSUCCESS",
     ),
     # -- D: DoS-shaped finish-removes (time disproportionate to gas) --------
@@ -603,11 +642,14 @@ CATEGORIES: dict[str, Category] = {
 
 ACCUMULATE_DEPTH_DEFAULT = 500
 ACCUMULATE_DEPTH_OVERRIDES = {"return_1": 800}   # per-case tuning
+# Single-call presets show no scaling signal, so they don't accumulate.
+ACCUMULATE_EXCLUDE = {"cache_miss_single", "cache_hit_single"}
 
 CATEGORIES = {
     name: (replace(cat, accumulate_depth=ACCUMULATE_DEPTH_OVERRIDES.get(
                 name, ACCUMULATE_DEPTH_DEFAULT))
-           if cat.lifecycle != PREFLIGHT_REJECT else cat)
+           if cat.lifecycle != PREFLIGHT_REJECT and name not in ACCUMULATE_EXCLUDE
+           else cat)
     for name, cat in CATEGORIES.items()
 }
 

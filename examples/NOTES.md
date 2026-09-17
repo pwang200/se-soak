@@ -354,6 +354,23 @@ Escrow/soak (includes accumulation) from Escrow/baseline and non-escrow types.
 Validated: return_1 N=20 and N=500 (per-Finish time flat ~50us across live
 0-500 = baseline); return_0 rejects at depth then cancels after expiry.
 
+cache_le_pattern family (2026-09-17): merged old C5 (unknown_keylet, now
+retired) with the cache_le-storm idea. One template (wats/cache_le_pattern.wat,
+generated; MAX_N=150) whose Finish loops `count` times: accountroot_id(account)
+-> keylet -> cache_le(slot 1 reused, so each call does a fresh view().read of a
+distinct object = the disk-read driver). Two patch slots: u32_count and
+account_id_array (fills the first `count` 20-byte entries with a shuffled
+hit/miss mix; hits distinct real accounts, misses random). patch_params is now a
+FLAT dict read by all roles ({"iterations":N,"hit_ratio":r}); known_keylet moved
+to {"valid_ratio":1.0}. Five presets: cache_{miss,hit}_single (iters=1),
+cache_{miss,hit,mixed}_storm (iters=150, gas 900k, accumulate 500); the two
+_single are excluded from accumulate. iterations cap ~180/Finish (each ~5350 gas
+vs 1M GasLimit). DoS signal (wall vs gas, hit vs miss) needs disk reads: misses
+hit disk anywhere (random SHAMap paths), hits only with a large cold funded pool
+(soak scale). Live dev (20 accts, warm): all 5 tesSUCCESS; singles ~5874 gas
+~300us, storms ~806749 gas ~500us (hit storm ~640us) -> wall small vs gas at dev;
+the inversion at soak scale is the watch item.
+
 Open question — terQUEUED vs the other three:
 The other three codes (tefPAST_SEQ, terPRE_SEQ, tefMAX_LEDGER) all mean
 "your local seq is wrong, refresh fixes it." terQUEUED is different:

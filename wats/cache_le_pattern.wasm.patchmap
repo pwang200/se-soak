@@ -1,0 +1,20 @@
+{
+  "template": "cache_le_pattern",
+  "length": 3206,
+  "slots": [
+    {
+      "name": "count",
+      "offset": 196,
+      "length": 4,
+      "role": "u32_count",
+      "params": {}
+    },
+    {
+      "name": "accounts",
+      "offset": 206,
+      "length": 3000,
+      "role": "account_id_array",
+      "params": {}
+    }
+  ]
+}

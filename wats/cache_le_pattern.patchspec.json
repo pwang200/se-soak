@@ -1,0 +1,7 @@
+{
+  "template": "cache_le_pattern",
+  "slots": [
+    {"name": "count", "sentinel": "5AFEC0DE", "role": "u32_count"},
+    {"name": "accounts", "sentinel": "ACCE55A2000102030405060708090A0B0C0D0E0F", "length": 3000, "role": "account_id_array"}
+  ]
+}

@@ -213,15 +213,41 @@ Cancels after expiry.
 
 ## 5. Category registry and WASM_TIMING interpretation
 
-Sixteen categories (escrow_lib.CATEGORIES), grouped by lifecycle:
+Twenty categories (escrow_lib.CATEGORIES), grouped by lifecycle:
 preflight_reject (unknown_imports, disabled_instructions, unfunded_account),
 cancel_removes (return_0, oog_execute, oog_compile, trap_div_by_zero),
 finish_removes (return_1, update_data_then_success, trace_heavy,
-oom_at_max_page, unknown_keylet, known_keylet, boundary_float, many_locals,
-home_le_field_bytecode). Each declares its own `gas` allowance; the fee is
-charged on the allowance, not on gas used. Every non-preflight case also sets
+oom_at_max_page, known_keylet, boundary_float, many_locals,
+home_le_field_bytecode, and the five cache_le_pattern presets below). Each
+declares its own `gas` allowance; the fee is charged on the allowance, not on
+gas used. Every non-preflight case (except the two _single presets) also sets
 `accumulate_depth` (§1, §4a), declared centrally in escrow_lib so support and
 default N are in one place.
+
+**cache_le_pattern family** (one template, wats/cache_le_pattern.wat; retires
+the old unknown_keylet). Each Finish loops `iterations` times, computing an
+AccountRoot keylet from a patched account id and calling cache_le (reusing one
+slot, so every call does a fresh read of a distinct object). The patcher fills
+a per-cycle hit/miss mix in random order — hits are distinct real pool accounts
+(cache_le finds them), misses are random ids (not found). Presets:
+
+| preset | iterations | hit_ratio | gas | accumulate |
+|---|---|---|---|---|
+| cache_miss_single | 1 | 0.0 | 8,000 | no |
+| cache_hit_single | 1 | 1.0 | 8,000 | no |
+| cache_miss_storm | 150 | 0.0 | 900,000 | 500 |
+| cache_hit_storm | 150 | 1.0 | 900,000 | 500 |
+| cache_mixed_storm | 150 | 0.5 | 900,000 | 500 |
+
+iterations caps at ~180 per Finish (each ~5350 gas against the 1M GasLimit);
+150 completes with margin. The point is DoS: whether per-cache_le wall time
+scales with gas and whether hit or miss is disproportionate. That signal needs
+disk reads, which need a source pool larger than cache: misses hit disk on any
+ledger (random SHAMap paths), hits only when the funded pool is large and cold
+(soak scale, not dev). Live first cycles (dev, 20 accounts, warm): all five
+finish tesSUCCESS; singles ~5,874 gas ~300 µs, storms ~806,749 gas ~500 µs
+(hit storm ~640 µs), so at dev scale wall time is small relative to gas — the
+inversion at soak scale is the thing to watch.
 
 The D-group (boundary_float, many_locals, home_le_field_bytecode) probes DoS
 shapes where wall time is disproportionate to gas charged (audit findings
