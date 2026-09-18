@@ -6,6 +6,9 @@ category run to ledger-neutral, blocking on every tx:
   finish_removes    Create → Finish (tesSUCCESS) → done
   cancel_removes    Create → Finish (tecBYTECODE_REJECTED, escrow stays)
                     → wait CancelAfter → Cancel → done
+  retry_finish_until_success  Create → Finish (reject) → Finish … until
+                    tesSUCCESS (cap MAX_FINISH_ATTEMPTS); a true failure
+                    (out-of-gas/trap) falls through to the Cancel cleanup.
   preflight_reject  Create (rejected, tem*) → done. Nothing to clean up.
 
 Backstop: anything that leaves an escrow on the ledger against expectation
@@ -32,6 +35,7 @@ from escrow_lib import (
     FINISH_REMOVES,
     MAX_FINISH_ATTEMPTS,
     PREFLIGHT_REJECT,
+    RETRY_FINISH_UNTIL_SUCCESS,
     Category,
     Pattern,
     PatternContext,
@@ -155,16 +159,24 @@ class SerialPattern(Pattern):
             ))
             return
 
-        # ---- finish_removes: Finish (possibly repeated) removes the escrow ----
-        if category.lifecycle == FINISH_REMOVES:
-            if not self._finish_until_removed(worker, category, create_sub,
-                                              ctx, thread_idx):
-                # Not removed after the allowed attempts — stranded.
-                pending_q.append(PendingCancel(
-                    offer_sequence=create_sub.offer_sequence,
-                    category=category,
-                    cancel_after_ripple=create_sub.cancel_after_ripple,
-                ))
+        # ---- finish_removes / retry_finish_until_success: Finish removes it --
+        if category.lifecycle in (FINISH_REMOVES, RETRY_FINISH_UNTIL_SUCCESS):
+            status = self._drive_finishes(worker, category, create_sub, ctx,
+                                          thread_idx)
+            if status == "removed":
+                return
+            if status == "failed":
+                # Retry lifecycle only: a truly-failed Finish (out-of-gas/trap)
+                # falls through to cancel-after-expiry cleanup.
+                self._cancel_after_expiry(worker, category, create_sub, ctx,
+                                          thread_idx, pending_q)
+                return
+            # reject_exhausted (or a finish_removes non-success) — stranded.
+            pending_q.append(PendingCancel(
+                offer_sequence=create_sub.offer_sequence,
+                category=category,
+                cancel_after_ripple=create_sub.cancel_after_ripple,
+            ))
             return
 
         # ---- cancel_removes: one Finish (expected to fail), wait, Cancel ----
@@ -182,14 +194,22 @@ class SerialPattern(Pattern):
         if finish_final == "tesSUCCESS":
             # wasm unexpectedly succeeded; escrow already gone, no Cancel.
             return
+        self._cancel_after_expiry(worker, category, create_sub, ctx,
+                                  thread_idx, pending_q)
 
+    def _cancel_after_expiry(self, worker: Worker, category: Category,
+                             create_sub, ctx: PatternContext, thread_idx: int,
+                             pending_q: deque[PendingCancel]) -> None:
+        """Wait out CancelAfter, then Cancel the escrow. Used by cancel_removes
+        and by the retry lifecycle's true-failure fall-through. A Cancel that
+        doesn't validate tesSUCCESS is flagged and parked for the backstop."""
         worker.wait_for_expiry(create_sub.cancel_after_ripple)
         if ctx.stop_event.is_set():
             return
-        olf3 = get_open_ledger_fee(ctx.rpc_url)
+        olf = get_open_ledger_fee(ctx.rpc_url)
         cancel_sub, cancel_final = self.submit_and_log(
             ctx, thread_idx, worker.address, category.name, "cancel",
-            lambda: worker.cancel(create_sub.offer_sequence, olf3),
+            lambda: worker.cancel(create_sub.offer_sequence, olf),
         )
         if cancel_final != "tesSUCCESS":
             self.flag_unexpected(thread_idx, worker.address, category,
@@ -202,20 +222,23 @@ class SerialPattern(Pattern):
                 cancel_after_ripple=create_sub.cancel_after_ripple,
             ))
 
-    def _finish_until_removed(self, worker: Worker, category: Category,
-                              create_sub, ctx: PatternContext,
-                              thread_idx: int) -> bool:
-        """Submit EscrowFinish for a finish_removes category; return True if
-        one validated tesSUCCESS (escrow removed).
-
-        A normal category runs exactly one Finish. A multi_finish category
-        (C2) retries while the wasm rejects — its first Finish writes data and
-        returns tecBYTECODE_REJECTED, its next returns success — capped at
-        MAX_FINISH_ATTEMPTS. Intermediate tecBYTECODE_REJECTED is expected by
-        construction and not flagged; any other non-success result, or failing
-        to succeed within the cap, is flagged and leaves the escrow stranded.
+    def _drive_finishes(self, worker: Worker, category: Category,
+                        create_sub, ctx: PatternContext,
+                        thread_idx: int) -> str:
+        """Run EscrowFinish for a finish_removes or retry_finish_until_success
+        category. Returns:
+          "removed"          a Finish validated tesSUCCESS (escrow gone);
+          "failed"           retry only: a Finish truly failed (out-of-gas /
+                             trap), i.e. neither success nor the intermediate
+                             reject — caller cancel-cleans up;
+          "reject_exhausted" finish_removes got a non-success, or the retry
+                             lifecycle kept rejecting past MAX_FINISH_ATTEMPTS —
+                             caller strands it for the backstop.
+        The retry lifecycle expects an intermediate tecBYTECODE_REJECTED (a
+        stateful wasm that writes its Data then succeeds); that is not flagged.
         """
-        attempts = MAX_FINISH_ATTEMPTS if category.multi_finish else 1
+        retry = category.lifecycle == RETRY_FINISH_UNTIL_SUCCESS
+        attempts = MAX_FINISH_ATTEMPTS if retry else 1
         for i in range(attempts):
             olf = get_open_ledger_fee(ctx.rpc_url)
             sub, final = self.submit_and_log(
@@ -223,12 +246,14 @@ class SerialPattern(Pattern):
                 lambda o=olf: worker.finish(category, create_sub.offer_sequence, o),
             )
             if final == "tesSUCCESS":
-                return True
-            if category.multi_finish and final == "tecBYTECODE_REJECTED" \
-                    and i < attempts - 1:
-                continue        # expected intermediate; retry
+                return "removed"
+            if retry and final == "tecBYTECODE_REJECTED" and i < attempts - 1:
+                continue                    # expected intermediate; retry
+            # Terminal for this call.
             self.flag_unexpected(thread_idx, worker.address, category,
                                  "finish", category.expected_finish_result,
                                  final or sub.engine_result, sub.tx_hash)
-            return False
-        return False
+            if retry and final != "tecBYTECODE_REJECTED":
+                return "failed"             # true failure -> cancel cleanup
+            return "reject_exhausted"
+        return "reject_exhausted"

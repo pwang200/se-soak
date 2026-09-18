@@ -56,6 +56,7 @@ from escrow_lib import (
     FINISH_REMOVES,
     MAX_FINISH_ATTEMPTS,
     PREFLIGHT_REJECT,
+    RETRY_FINISH_UNTIL_SUCCESS,
     Category,
     Pattern,
     PatternContext,
@@ -107,7 +108,7 @@ class InFlight:
     last_action: str = "create"   # create | finish | cancel | cancel_backstop
     create_round: int = 0         # round in which Create was submitted
     backstop_attempts: int = 0
-    finish_attempts: int = 0      # EscrowFinish submits (for multi_finish cap)
+    finish_attempts: int = 0      # EscrowFinish submits (for retry_finish_until_success cap)
 
 
 # -- pattern ----------------------------------------------------------------
@@ -222,6 +223,7 @@ class PipelinePattern(Pattern):
                         q.remove(entry)  # not applied; nothing created
 
                 elif entry.status == PENDING_FINISH:
+                    retry = cat.lifecycle == RETRY_FINISH_UNTIL_SUCCESS
                     if final == "tesSUCCESS":
                         if final != cat.expected_finish_result:
                             self.flag_unexpected(thread_idx, worker.address,
@@ -229,11 +231,19 @@ class PipelinePattern(Pattern):
                                                  cat.expected_finish_result,
                                                  final, sub.tx_hash)
                         q.remove(entry)  # Finish removed the escrow
-                    elif cat.multi_finish and final == "tecBYTECODE_REJECTED" \
+                    elif retry and final == "tecBYTECODE_REJECTED" \
                             and entry.finish_attempts < MAX_FINISH_ATTEMPTS:
                         # Expected intermediate reject (wasm wrote data);
                         # re-Finish next round. Not flagged.
                         entry.status = CREATED
+                    elif retry and final != "tecBYTECODE_REJECTED":
+                        # retry lifecycle, truly-failed Finish (out-of-gas /
+                        # trap): fall through to cancel-after-expiry cleanup.
+                        self.flag_unexpected(thread_idx, worker.address, cat,
+                                             "finish",
+                                             cat.expected_finish_result,
+                                             final, sub.tx_hash)
+                        entry.status = AWAIT_CANCEL
                     elif cat.lifecycle == CANCEL_REMOVES:
                         if final != cat.expected_finish_result:
                             self.flag_unexpected(thread_idx, worker.address,
@@ -243,7 +253,7 @@ class PipelinePattern(Pattern):
                         entry.status = AWAIT_CANCEL  # expected path
                     else:
                         # finish_removes that didn't remove the escrow, or a
-                        # multi_finish that exhausted its attempts.
+                        # retry lifecycle that exhausted its attempts.
                         self.flag_unexpected(thread_idx, worker.address, cat,
                                              "finish",
                                              cat.expected_finish_result,

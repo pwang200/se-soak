@@ -327,7 +327,13 @@ def cancel_fee_drops(open_ledger_fee: int) -> int:
 FINISH_REMOVES = "finish_removes"
 CANCEL_REMOVES = "cancel_removes"
 PREFLIGHT_REJECT = "preflight_reject"
-LIFECYCLES = frozenset({FINISH_REMOVES, CANCEL_REMOVES, PREFLIGHT_REJECT})
+# Stateful wasm: the first Finish is expected to reject (tecBYTECODE_REJECTED,
+# e.g. after writing its own Data), a later Finish succeeds. Retry Finish up to
+# MAX_FINISH_ATTEMPTS; a truly-failed Finish (out-of-gas / trap) falls through
+# to the cancel-after-expiry cleanup instead of retrying.
+RETRY_FINISH_UNTIL_SUCCESS = "retry_finish_until_success"
+LIFECYCLES = frozenset({FINISH_REMOVES, CANCEL_REMOVES, PREFLIGHT_REJECT,
+                        RETRY_FINISH_UNTIL_SUCCESS})
 
 
 @dataclass(frozen=True)
@@ -351,13 +357,14 @@ class Category:
                             unfunded wallet (Destination = the pool account)
                             instead of the pool account. Expected to be
                             rejected with terNO_ACCOUNT. preflight_reject.
-    multi_finish            finish_removes only: keep submitting EscrowFinish
-                            until it validates tesSUCCESS, capped at
-                            MAX_FINISH_ATTEMPTS. For a stateful wasm whose
-                            first finish rejects (writes data) and whose next
-                            finish succeeds. expected_finish_result is the
-                            TERMINAL result (tesSUCCESS); intermediate
-                            tecBYTECODE_REJECTED is expected by construction.
+    lifecycle retry_finish_until_success: for a stateful wasm whose first
+                            Finish rejects (tecBYTECODE_REJECTED after writing
+                            its Data) and a later Finish succeeds. The driver
+                            retries Finish up to MAX_FINISH_ATTEMPTS;
+                            expected_finish_result is the TERMINAL result
+                            (tesSUCCESS) and the intermediate reject is expected.
+                            A truly-failed Finish (out-of-gas / trap) falls
+                            through to cancel-after-expiry cleanup.
 
     wasm vs template: a category ships EITHER a static `wasm` blob (fixed for
     every cycle) OR a `template` (escrow_patch.Template) that the driver
@@ -383,7 +390,6 @@ class Category:
     expected_create_result: str = "tesSUCCESS"
     expected_finish_result: Optional[str] = None
     ephemeral_sender: bool = False
-    multi_finish: bool = False
     accumulate_depth: Optional[int] = None
 
     def __post_init__(self):
@@ -425,10 +431,6 @@ class Category:
                 f"{self.name}: preflight_reject must declare the expected "
                 f"reject code in expected_create_result"
             )
-        if self.multi_finish and self.lifecycle != FINISH_REMOVES:
-            raise ValueError(
-                f"{self.name}: multi_finish only applies to finish_removes"
-            )
         if self.ephemeral_sender and self.lifecycle != PREFLIGHT_REJECT:
             raise ValueError(
                 f"{self.name}: ephemeral_sender only applies to "
@@ -437,7 +439,8 @@ class Category:
 
     @property
     def runs_finish(self) -> bool:
-        return self.lifecycle in (FINISH_REMOVES, CANCEL_REMOVES)
+        return self.lifecycle in (FINISH_REMOVES, CANCEL_REMOVES,
+                                  RETRY_FINISH_UNTIL_SUCCESS)
 
     @property
     def wasm_size(self) -> int:
@@ -459,7 +462,7 @@ class Category:
         return patch_ctx.patch(self.template, rng, self.patch_params)
 
 
-# EscrowFinish attempts before a multi_finish category is declared stranded.
+# EscrowFinish attempts before a retry_finish_until_success case is stranded.
 MAX_FINISH_ATTEMPTS = 4
 
 # Values marked PLACEHOLDER are best guesses; the pattern flags [unexpected]
@@ -529,9 +532,8 @@ CATEGORIES: dict[str, Category] = {
         name="update_data_then_success",
         wasm=load_wasm("update_data_then_success.wasm"),
         gas=5_000,
-        lifecycle=FINISH_REMOVES,
+        lifecycle=RETRY_FINISH_UNTIL_SUCCESS,
         expected_finish_result="tesSUCCESS",         # terminal; 1st is reject
-        multi_finish=True,
     ),
     "trace_heavy": Category(
         name="trace_heavy",
@@ -643,7 +645,10 @@ CATEGORIES: dict[str, Category] = {
 ACCUMULATE_DEPTH_DEFAULT = 500
 ACCUMULATE_DEPTH_OVERRIDES = {"return_1": 800}   # per-case tuning
 # Single-call presets show no scaling signal, so they don't accumulate.
-ACCUMULATE_EXCLUDE = {"cache_miss_single", "cache_hit_single"}
+# update_data_then_success is retry_finish_until_success (stateful, single
+# escrow at a time), which the accumulate drain doesn't model.
+ACCUMULATE_EXCLUDE = {"cache_miss_single", "cache_hit_single",
+                     "update_data_then_success"}
 
 CATEGORIES = {
     name: (replace(cat, accumulate_depth=ACCUMULATE_DEPTH_OVERRIDES.get(
