@@ -387,3 +387,76 @@ At soak load with open_ledger_fee jumping, terQUEUED is the most likely
 same as the other three → fail-loud exit on the second hit, which is
 the operator's signal to raise fee headroom. Acceptable for now;
 revisit if we see terQUEUED churn during real runs.
+
+Revisit pass (2026-09-17): retry lifecycle, per-case lifecycles+purpose, B3 rewrite:
+Promoted the old `multi_finish` bool to a named lifecycle retry_finish_until_success
+and added a true-failure fall-through. Every case now declares a `lifecycles` SET
+(base lifecycle + accumulate_then_drain when it opts into the burst pattern) and a
+`purpose` SET (informational only: baseline / correctness / dos / leak). Declared
+centrally in escrow_lib via dataclasses.replace so support + intent read in one place.
+
+Case x lifecycles x purpose (20 categories):
+  category                    base lifecycle              accum  purpose
+  unknown_imports             preflight_reject            -      correctness
+  disabled_instructions       preflight_reject            -      correctness
+  unfunded_account            preflight_reject            -      correctness
+  return_0                    cancel_removes              yes    baseline,correctness
+  oog_execute                 cancel_removes              yes    correctness
+  oog_compile                 cancel_removes              -      correctness
+  trap_div_by_zero            cancel_removes              -      correctness
+  return_1                    finish_removes              yes    baseline
+  update_data_then_success    retry_finish_until_success  -      correctness
+  trace_heavy                 finish_removes              -      correctness
+  oom_at_max_page             finish_removes              -      correctness
+  known_keylet                finish_removes              -      correctness,dos
+  cache_miss_single           finish_removes              -      correctness,dos
+  cache_hit_single            finish_removes              -      correctness,dos
+  cache_miss_storm            finish_removes              yes    dos,leak
+  cache_hit_storm             finish_removes              yes    dos,leak
+  cache_mixed_storm           finish_removes              yes    dos,leak
+  boundary_float              finish_removes              yes    dos
+  many_locals                 finish_removes              yes    dos
+  home_le_field_bytecode      finish_removes              yes    dos
+accumulate_then_drain is a run-mode carried in the lifecycles set (not a base
+lifecycle); only the six cases the task named plus the three storm presets opt in.
+oog_compile, trap_div_by_zero, trace_heavy, oom_at_max_page, known_keylet, the two
+_single presets, and update_data_then_success do NOT accumulate. preflight_reject
+cases never create an escrow, so they can't accumulate at all.
+
+retry_finish_until_success (was multi_finish): re-submit Finish while the wasm
+returns tecBYTECODE_REJECTED, cap MAX_FINISH_ATTEMPTS=4, stop at the first
+tesSUCCESS. NEW fall-through: a *true* Finish failure (out-of-gas / trap, i.e.
+neither success nor the intermediate reject) now drops to the cancel_removes
+cleanup (wait CancelAfter, Cancel) instead of stranding; only cap-exhaustion
+strands (backstop). One live case: update_data_then_success (C2). Verified live
+end-to-end (2026-09-17): create tesSUCCESS, Finish #1 tecBYTECODE_REJECTED (writes
+its own sfData = (7<<16)|27 = 458779 via set_data), Finish #2 tesSUCCESS. gas=5000.
+
+B3 oog_compile rewritten (deliverable 3): the generator (wats/gen_oog_compile.py)
+now emits ONE huge escrow_finish body — an early `return (i32.const 1)` guard then
+PAIRS copies of `(i32.const 0)(drop)` — instead of many small helper functions.
+Under Wasmi LazyTranslation the function is translated (and charged) only on first
+entry, and the huge body exhausts the Gas allowance during that translation before
+a single body instruction runs, so WASM_TIMING_FINISH shows tecOUT_OF_GAS with
+gas=0 (translation-OOG, distinct from B2's execution-OOG gas~=allowance). Live-
+confirmed at gas=1000: PAIRS=20000 -> 60053 B wasm -> tecOUT_OF_GAS gas=0 reliably;
+PAIRS=30000 -> 90053 B -> also OOGs but nears the 100 KB BytecodeSizeLimit. Committed
+build is PAIRS=20000 (~60 KB, comfortable margin). Reliable size to report: 20000
+pairs.
+
+Audit 3.4 structurally fixed in a pending PR — leak weight now LOW for A*/B3:
+Audit finding 3.4 (the TxQ / preflight path allocates wasm arena entries before
+cheaper checks — e.g. account existence — so rejected or aborted-early Finishes
+still churn allocations) is being fixed structurally in a pending rippled PR. With
+that fix landed, the per-invocation allocation churn on the preflight / lazy-
+translation path is bounded, so the LEAK-signal weight for the cases that mainly
+exercise that path is now LOW:
+  - A1 unknown_imports, A2 disabled_instructions, A3 unfunded_account
+    (preflight_reject — rejected in preflight, never execute a body);
+  - B3 oog_compile (translation-OOG — dies during lazy translation on entry).
+Keep these cases: they are still correctness coverage (the reject/OOG codes must
+stay stable) and A3 still exercises the audit-3.4 ordering directly. But do NOT
+read RSS growth across an A*/B3-heavy run as a leak once the PR is in — that path
+is the one the PR bounds. The leak watch shifts to the storm/accumulate cases
+(cache_*_storm, the D-group under accumulate), which exercise live-object and
+per-execution allocation, not preflight churn.

@@ -2,9 +2,10 @@
 ;; the escrow has no Data field, so it writes one (set_data) and returns 0
 ;; (rejected; the write survives a reject and the escrow stays). On the SECOND
 ;; escrow_finish the Data field is present, so it returns 1 and the escrow is
-;; removed. Requires the driver's multi-Finish mode (finish_removes, capped).
+;; removed. Requires the retry_finish_until_success lifecycle (re-Finish on an
+;; intermediate tecBYTECODE_REJECTED, capped at MAX_FINISH_ATTEMPTS).
 ;;
-;; Category:  update_data_then_success   Lifecycle: finish_removes (multi)  Gas: 5000
+;; Category:  update_data_then_success   Lifecycle: retry_finish_until_success  Gas: 5000
 ;; Expected: 1st Finish tecBYTECODE_REJECTED, terminal Finish tesSUCCESS.
 ;;
 ;; home_le_field(field, out_ptr, out_len) -> bytes written, or a negative host

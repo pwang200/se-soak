@@ -63,17 +63,32 @@ the binary codec (codes from the branch's server_definitions: Bytecode nth 47
 Blob, Gas nth 84 UInt32). Rationale: audit finding 3.4 — the TxQ runs wasm
 preflight, allocating arena entries, before checking that the account exists.
 
-### multi_finish (finish_removes variant: `update_data_then_success`)
+### retry_finish_until_success (`update_data_then_success`)
 
-A finish_removes category may set `multi_finish=True`: the driver submits
-EscrowFinish repeatedly while the wasm rejects (tecBYTECODE_REJECTED), up to
-MAX_FINISH_ATTEMPTS (4), stopping at the first tesSUCCESS. For a stateful wasm
-whose first finish writes data and rejects and whose next finish reads that
-data and succeeds. `expected_finish_result` is the *terminal* result
-(tesSUCCESS); intermediate rejects are expected by construction and not
-flagged. Exhausting the cap without success strands the escrow (backstop
-Cancel). Both patterns implement it: serial loops in-cycle
-(`_finish_until_removed`); pipeline re-Finishes across rounds, tracking
+| # | tx | expected engine_result / validated result |
+|---|---|---|
+| 1 | EscrowCreate | tesSUCCESS / tesSUCCESS |
+| 2 | EscrowFinish {OfferSequence, Gas} | tecBYTECODE_REJECTED — wasm wrote its Data and returned 0, escrow stays |
+| 3 | EscrowFinish {OfferSequence, Gas} | tesSUCCESS — wasm read its Data and returned 1, escrow removed |
+
+A lifecycle for a stateful wasm whose Finish rejects until state it writes
+accumulates, then succeeds. The driver re-submits EscrowFinish while the wasm
+returns tecBYTECODE_REJECTED, up to MAX_FINISH_ATTEMPTS (4), stopping at the
+first tesSUCCESS. `expected_finish_result` is the *terminal* result
+(tesSUCCESS); the intermediate rejects are expected by construction and not
+flagged. Two fall-throughs keep the ledger clean:
+  - a *true* Finish failure (out-of-gas / trap — neither success nor the
+    intermediate reject) drops to the cancel_removes cleanup: wait CancelAfter,
+    then Cancel;
+  - exhausting MAX_FINISH_ATTEMPTS without a success strands the escrow for the
+    backstop Cancel (§2).
+
+The one live case is update_data_then_success (C2): Finish #1 reads its own
+sfData (full SField code (7<<16)|27 = 458779), finds it absent, writes one byte
+with set_data, and returns 0 (reject, escrow stays); Finish #2 sees the Data
+present and returns 1 (escrow removed). Confirmed live: reject then success in
+two Finishes at gas=5000. Both patterns implement it: serial loops in-cycle
+(`_drive_finishes`); pipeline re-Finishes across rounds, tracking
 `finish_attempts` on the in-flight entry.
 
 ### accumulate_then_drain (opt-in via a case's accumulate_depth)
@@ -213,16 +228,41 @@ Cancels after expiry.
 
 ## 5. Category registry and WASM_TIMING interpretation
 
-Twenty categories (escrow_lib.CATEGORIES), grouped by lifecycle:
-preflight_reject (unknown_imports, disabled_instructions, unfunded_account),
-cancel_removes (return_0, oog_execute, oog_compile, trap_div_by_zero),
-finish_removes (return_1, update_data_then_success, trace_heavy,
-oom_at_max_page, known_keylet, boundary_float, many_locals,
-home_le_field_bytecode, and the five cache_le_pattern presets below). Each
-declares its own `gas` allowance; the fee is charged on the allowance, not on
-gas used. Every non-preflight case (except the two _single presets) also sets
-`accumulate_depth` (§1, §4a), declared centrally in escrow_lib so support and
-default N are in one place.
+Twenty categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
+`lifecycles` set (the base plus `accumulate_then_drain` if it opts into the
+burst pattern), a `purpose` set (informational: baseline / correctness / dos /
+leak), and its own `gas` allowance; the fee is charged on the allowance, not on
+gas used. Which cases accumulate and their default N (`accumulate_depth`) are
+declared centrally in escrow_lib so support and defaults are read/tuned in one
+place.
+
+| category | base lifecycle | accumulate | purpose | gas |
+|---|---|---|---|---|
+| unknown_imports | preflight_reject | — | correctness | 1,000 |
+| disabled_instructions | preflight_reject | — | correctness | 1,000 |
+| unfunded_account | preflight_reject | — | correctness | 1,000 |
+| return_0 | cancel_removes | yes | baseline, correctness | 1,000 |
+| oog_execute | cancel_removes | yes | correctness | 1,000 |
+| oog_compile | cancel_removes | — | correctness | 1,000 |
+| trap_div_by_zero | cancel_removes | — | correctness | 1,000 |
+| return_1 | finish_removes | yes | baseline | 1,000 |
+| update_data_then_success | retry_finish_until_success | — | correctness | 5,000 |
+| trace_heavy | finish_removes | — | correctness | 300,000 |
+| oom_at_max_page | finish_removes | — | correctness | 1,000 |
+| known_keylet | finish_removes | — | correctness, dos | 6,000 |
+| cache_miss_single | finish_removes | — | correctness, dos | 8,000 |
+| cache_hit_single | finish_removes | — | correctness, dos | 8,000 |
+| cache_miss_storm | finish_removes | yes | dos, leak | 900,000 |
+| cache_hit_storm | finish_removes | yes | dos, leak | 900,000 |
+| cache_mixed_storm | finish_removes | yes | dos, leak | 900,000 |
+| boundary_float | finish_removes | yes | dos | 50,000 |
+| many_locals | finish_removes | yes | dos | 100,000 |
+| home_le_field_bytecode | finish_removes | yes | dos | 20,000 |
+
+Purpose is informational only — it labels intent (baseline = a trivial control,
+correctness = a specific result/behaviour under test, dos = a wall-time-vs-gas
+probe, leak = a concurrent-live-count probe) and does not change how a case
+runs. A case can carry more than one tag.
 
 **cache_le_pattern family** (one template, wats/cache_le_pattern.wat; retires
 the old unknown_keylet). Each Finish loops `iterations` times, computing an
@@ -257,21 +297,24 @@ against `gas=` (units charged). many_locals is the sharpest live example —
 `time=` per `gas=` stands out from the trivial return_1 baseline is the
 signal.
 
-All fifteen behave as intended. Two earlier issues were resolved: oog_compile
+All twenty behave as intended. Two earlier issues were resolved: oog_compile
 runs out of translation fuel (§6), and update_data_then_success converges once
 its home_le_field field code was corrected (§6).
 
 ## 6. Known limitations / open questions
 
 - **oog_compile (resolved).** Wasmi uses CompilationMode::LazyTranslation:
-  a function is translated (and charged) only when first CALLED, and
-  unreferenced functions are never translated. The first version left the
-  noise functions uncalled, so they cost nothing (gas=30, Finish tesSUCCESS).
-  Now escrow_finish calls all of them (each an early `return` then a large dead
-  body), so their full bodies translate on first entry: Finish returns
-  tecOUT_OF_GAS with gas=0 in WASM_TIMING_FINISH — it exhausts the allowance in
-  translation before executing any body instruction. That gas=0 is how
-  translation-OOG (B3) reads apart from execution-OOG (B2, gas≈allowance).
+  a function is translated (and charged) only when first CALLED. The cost is put
+  on escrow_finish's OWN body: it is one huge function — an early
+  `return (i32.const 1)` guard followed by PAIRS copies of `(i32.const 0)(drop)`
+  (default 20,000, ~60 KB wasm, under the 100 KB BytecodeSizeLimit). Translating
+  that body on first entry exhausts the Gas allowance before a single body
+  instruction executes: Finish returns tecOUT_OF_GAS with gas=0 in
+  WASM_TIMING_FINISH. That gas=0 is how translation-OOG (B3) reads apart from
+  execution-OOG (B2, gas≈allowance). (An earlier version used many small helper
+  functions called from escrow_finish; one huge body is simpler and puts the
+  cost squarely on the function actually entered.) Live-confirmed: 20,000 pairs
+  reliably OOG at gas=1,000; 30,000 (~90 KB) also OOGs but nears the size cap.
 - **home_le_field takes the full SField code, not the bare nth.** invokeWithField
   (HostContext.cpp:195) looks the argument up in SField::getKnownCodeToField(),
   keyed by (type<<16)|nth. update_data_then_success passed 27 for sfData and

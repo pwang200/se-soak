@@ -18,9 +18,11 @@ N (accumulation depth) comes from the category's accumulate_depth, overridable
 with --accumulate-depth. Realistic depths are hundreds to low thousands; small
 N won't show accumulation scaling (steady-state already sits near 1 per worker).
 
-Draining uses the case's base lifecycle: finish_removes -> Finish each;
-cancel_removes -> (step 3) Finish then Cancel after expiry. Only finish_removes
-draining is implemented here; a cancel_removes case under accumulate raises.
+Draining uses the case's base lifecycle: finish_removes -> Finish each (the
+Finish removes it); cancel_removes -> Finish each at depth (the reject is the
+measurement), wait out CancelAfter, then Cancel each. Both are implemented here;
+a case whose base lifecycle is neither (e.g. preflight_reject or
+retry_finish_until_success) can't accumulate and raises.
 
 Owner reserve is the binding limit: each live escrow locks ReserveIncrement
 (2 XRP) + its amount until drained, so peak hold ~ N*(2+amount) XRP. A create
@@ -42,6 +44,7 @@ import threading
 import time
 
 from escrow_lib import (
+    ACCUMULATE_THEN_DRAIN,
     CANCEL_REMOVES,
     FINISH_REMOVES,
     Category,
@@ -110,10 +113,11 @@ class AccumulatePattern(Pattern):
 
     def run_thread(self, thread_idx: int, accounts: list[Worker],
                    ctx: PatternContext) -> None:
-        caps = [c for c in ctx.categories if c.accumulate_depth is not None]
+        caps = [c for c in ctx.categories if ACCUMULATE_THEN_DRAIN in c.lifecycles]
         if not caps:
-            print("[FATAL] accumulate pattern: no category has "
-                  "accumulate_depth set", file=sys.stderr)
+            print("[FATAL] accumulate pattern: no selected category "
+                  "declares the accumulate_then_drain lifecycle",
+                  file=sys.stderr)
             ctx.failure_event.set(); ctx.stop_event.set(); return
         if self._detail is None and self.detail_path:
             # First thread to arrive opens the shared detail writer.

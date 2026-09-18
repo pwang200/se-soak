@@ -335,6 +335,15 @@ RETRY_FINISH_UNTIL_SUCCESS = "retry_finish_until_success"
 LIFECYCLES = frozenset({FINISH_REMOVES, CANCEL_REMOVES, PREFLIGHT_REJECT,
                         RETRY_FINISH_UNTIL_SUCCESS})
 
+# A run-mode, not a base cleanup lifecycle: it appears in a Category's
+# `lifecycles` set (alongside the base) when the case opts into --pattern
+# accumulate, but is never the base `lifecycle` field.
+ACCUMULATE_THEN_DRAIN = "accumulate_then_drain"
+
+# Informational classification of what a case is FOR. No driver behavior
+# depends on it yet; used in analysis and the NOTES table.
+PURPOSE_TAGS = frozenset({"leak", "dos", "correctness", "baseline"})
+
 
 @dataclass(frozen=True)
 class Category:
@@ -391,6 +400,9 @@ class Category:
     expected_finish_result: Optional[str] = None
     ephemeral_sender: bool = False
     accumulate_depth: Optional[int] = None
+    # Populated centrally below (see the metadata block after CATEGORIES).
+    lifecycles: frozenset = field(default_factory=frozenset)   # declared support
+    purpose: frozenset = field(default_factory=frozenset)      # PURPOSE_TAGS
 
     def __post_init__(self):
         if (self.wasm is None) == (self.template is None):
@@ -633,30 +645,80 @@ CATEGORIES: dict[str, Category] = {
 
 
 # ---------------------------------------------------------------------------
-# accumulate_then_drain support (--pattern accumulate)
-#
-# Every finish_removes / cancel_removes case can be accumulated; preflight_reject
-# cases never create an escrow, so they can't. Depth N is the default live count
-# to reach per owner before draining (override at run time with
-# --accumulate-depth). Declared in one place and applied with dataclasses.replace
-# so each case still validates through Category.__post_init__.
+# Case metadata: lifecycles supported + purpose. Declared here in one place and
+# applied with dataclasses.replace so each case still validates through
+# __post_init__. Each case's `lifecycles` set = its base lifecycle plus
+# accumulate_then_drain iff it opts into accumulation (below).
 # ---------------------------------------------------------------------------
 
-ACCUMULATE_DEPTH_DEFAULT = 500
-ACCUMULATE_DEPTH_OVERRIDES = {"return_1": 800}   # per-case tuning
-# Single-call presets show no scaling signal, so they don't accumulate.
-# update_data_then_success is retry_finish_until_success (stateful, single
-# escrow at a time), which the accumulate drain doesn't model.
-ACCUMULATE_EXCLUDE = {"cache_miss_single", "cache_hit_single",
-                     "update_data_then_success"}
+# Cases that support --pattern accumulate, and their default depth N. Only the
+# cases where concurrent-live-count is a meaningful signal opt in: the
+# baselines, the D-group DoS cases, the cache storms, and the two cancel_removes
+# cases whose escrows drain via CancelAfter. preflight_reject (no escrow),
+# retry (stateful, single escrow), the _single presets, and the low-signal /
+# heavy cases (oog_compile, trap_div_by_zero, trace_heavy, oom_at_max_page) opt
+# out. Override N at run time with --accumulate-depth.
+ACCUMULATE_DEPTHS = {
+    "return_1": 800,
+    "return_0": 500,
+    "oog_execute": 500,
+    "boundary_float": 500,
+    "many_locals": 500,
+    "home_le_field_bytecode": 500,
+    "cache_miss_storm": 500,
+    "cache_hit_storm": 500,
+    "cache_mixed_storm": 500,
+}
+
+# Purpose tags per case (informational). See PURPOSE_TAGS. A1/A2/A3 and B3 were
+# leak cases; audit 3.4 is structurally fixed in a pending PR, so their leak
+# weight is now low and they read as correctness (see NOTES.md).
+CASE_PURPOSE = {
+    "unknown_imports": {"correctness"},
+    "disabled_instructions": {"correctness"},
+    "unfunded_account": {"correctness"},
+    "return_0": {"baseline", "correctness"},
+    "oog_execute": {"correctness"},
+    "oog_compile": {"correctness"},
+    "trap_div_by_zero": {"correctness"},
+    "return_1": {"baseline"},
+    "update_data_then_success": {"correctness"},
+    "trace_heavy": {"correctness"},
+    "oom_at_max_page": {"correctness"},
+    "known_keylet": {"dos", "correctness"},
+    "boundary_float": {"dos"},
+    "many_locals": {"dos"},
+    "home_le_field_bytecode": {"dos"},
+    "cache_miss_single": {"dos", "correctness"},
+    "cache_hit_single": {"dos", "correctness"},
+    "cache_miss_storm": {"dos", "leak"},
+    "cache_hit_storm": {"dos", "leak"},
+    "cache_mixed_storm": {"dos", "leak"},
+}
 
 CATEGORIES = {
-    name: (replace(cat, accumulate_depth=ACCUMULATE_DEPTH_OVERRIDES.get(
-                name, ACCUMULATE_DEPTH_DEFAULT))
-           if cat.lifecycle != PREFLIGHT_REJECT and name not in ACCUMULATE_EXCLUDE
-           else cat)
+    name: replace(
+        cat,
+        accumulate_depth=ACCUMULATE_DEPTHS.get(name),
+        lifecycles=frozenset({cat.lifecycle})
+        | (frozenset({ACCUMULATE_THEN_DRAIN}) if name in ACCUMULATE_DEPTHS
+           else frozenset()),
+        purpose=frozenset(CASE_PURPOSE.get(name, {"correctness"})),
+    )
     for name, cat in CATEGORIES.items()
 }
+
+# Belt-and-suspenders: every case classified, tags valid, accumulate only on
+# escrow-creating lifecycles.
+for _c in CATEGORIES.values():
+    _bad = _c.purpose - PURPOSE_TAGS
+    if _bad:
+        raise ValueError(f"{_c.name}: unknown purpose tags {_bad}")
+    if ACCUMULATE_THEN_DRAIN in _c.lifecycles and _c.lifecycle not in (
+            FINISH_REMOVES, CANCEL_REMOVES):
+        raise ValueError(
+            f"{_c.name}: accumulate_then_drain needs a finish_removes/"
+            f"cancel_removes base (has {_c.lifecycle})")
 
 
 # ---------------------------------------------------------------------------
