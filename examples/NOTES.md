@@ -460,3 +460,66 @@ read RSS growth across an A*/B3-heavy run as a leak once the PR is in — that p
 is the one the PR bounds. The leak watch shifts to the storm/accumulate cases
 (cache_*_storm, the D-group under accumulate), which exercise live-object and
 per-execution allocation, not preflight churn.
+
+Large-wasm cost dimensions (2026-09-21): dos_large_finish_{linear,looped,many_helpers}:
+Three new DoS categories that FORK the question the D-group only opens — which
+specific Wasmi cost dimension is underpriced, if any. All three are finish_removes,
+purpose=dos, accumulate-capable (depth 500), template-based (so each carries a
+zero-fuel opaque_random pad). Staged for a later xrpld build; NOT run live yet.
+
+Cost model background (all as understood on this branch):
+- Lazy translation: a function body translates to Wasmi IR on its FIRST call and
+  is billed against the caller's gas allowance at that call. Unreferenced functions
+  never translate (this is the B3 oog_compile mechanism).
+- Instantiation (data/elem sections, memory init) is charged ZERO fuel (verified
+  externally). That is why the opaque_random dedup-defeating pad lives in a (data
+  ...) section — it changes the module bytes without adding any measured fuel.
+- Anchor: another session measured a sustained pure-wasm cost of ~8.9 ns per unit
+  of fuel (gas) using a dependent cache-missing pointer chase. Treat it as ONE
+  data point, machine-specific, order-of-magnitude useful — the trio is partly a
+  cross-check on it, not a fit to it. Anything above ~8.9 ns/gas is stronger DoS
+  than a pure wasm loop already is; below is weaker.
+
+The three shapes (default sizes in parens):
+- linear (COUNT=5000, ~15 KB): one huge finish body, COUNT straight-line
+  (i32.const 1)(i32.add) units on one accumulator, no loop/branch. Every
+  instruction is TRANSLATED on entry AND EXECUTED once -> isolates per-instruction
+  (translation + execution) cost, summed. Size-capped by the 100 KB limit.
+- looped (ITERS=100 x BODY_UNITS=50 = 5000 executed units, ~0.5 KB): small body in
+  a hot loop, executed count comparable to linear's but translated ONCE ->
+  isolates per-executed-instruction cost, translation amortized. Capped only by
+  gas, not size.
+- many_helpers (N=5000, ~50 KB): finish calls N tiny one-instruction helpers once
+  each; each helper first-call-translates + one function entry inside the single
+  Finish -> isolates per-function-entry setup cost (as a differential over linear).
+  Size-capped by the 100 KB limit (~12 bytes/helper).
+
+Comparison framing (measure time_us/gas per shape from WASM_TIMING_FINISH; the
+relative comparison across the three matters more than absolute values):
+- linear elevated, looped NOT -> per-instruction TRANSLATION dominant (looped
+  would also be elevated if execution dominated, since it isolates execution).
+- looped elevated -> per-executed-instruction EXECUTION dominant.
+- many_helpers elevated over linear -> per-function-ENTRY setup dominant.
+- all three elevated vs ~8.9 -> Wasmi cost model is globally low.
+- none elevated vs ~8.9 -> cost model is honest at this shape.
+Caveat: many_helpers also translates+executes N tiny bodies, so it isolates entry
+cost only DIFFERENTIALLY against linear (helper bodies are one instruction each so
+entry overhead dominates the delta). And linear vs looped will NOT have equal gas
+even at equal executed counts — linear also pays translation fuel for all COUNT
+units — but time/gas normalizes that; that's the point of the ratio.
+
+Gas sizing: set to GasLimit max (1,000,000) for all three as STAGING headroom,
+because translation cost is unmeasured and a first-run OOG would waste a live
+cycle. Allowance does not distort the measurement (WASM_TIMING gas= is used, not
+allowed). After the first live run, recalibrate down to ~10x measured gas per the
+project's gas rule to keep Finish fees sane (1,000,000 gas ~= 1 XRP/Finish).
+
+Offline verification done (no live node): all three build via wat2wasm and pass
+wasm-validate; sizes linear 15093 B, looped 463 B, many_helpers 49971 B (all <
+100 KB). The driver's own path (Category.make_wasm -> PatchContext.patch) produces
+a valid module each cycle, two cycles differ (dedup defeated), and only the 32-byte
+pad slot changes. run_soak wires PatchContext whenever any selected category is a
+template (run_soak.py needs_patch), so these plumb through identically to the
+cache_le_pattern / keylet_probe templates; opaque_random needs no populated/ index
+or pool accounts. Live measurement (the time/gas comparison + gas recalibration)
+is deferred to the updated xrpld binary.

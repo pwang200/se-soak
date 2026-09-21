@@ -1,0 +1,13 @@
+{
+  "template": "dos_large_finish_looped",
+  "length": 463,
+  "slots": [
+    {
+      "name": "pad",
+      "offset": 431,
+      "length": 32,
+      "role": "opaque_random",
+      "params": {}
+    }
+  ]
+}

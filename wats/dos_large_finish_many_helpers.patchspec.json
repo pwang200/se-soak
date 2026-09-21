@@ -1,0 +1,10 @@
+{
+  "template": "dos_large_finish_many_helpers",
+  "slots": [
+    {
+      "name": "pad",
+      "sentinel": "D0513E19000102030405060708090A0B0C0D0E0F101112131415161718191A1B",
+      "role": "opaque_random"
+    }
+  ]
+}

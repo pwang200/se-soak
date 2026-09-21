@@ -641,6 +641,36 @@ CATEGORIES: dict[str, Category] = {
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
+    # -- D-large: which Wasmi cost dimension is underpriced? Three shapes that
+    # fork per-instruction (linear) vs per-executed-instruction (looped) vs
+    # per-function-entry (many_helpers) cost. Compare time_us/gas across the
+    # three and against the ~8.9 ns/gas anchor (see NOTES / flow.md). Each is a
+    # template only to carry a 32-byte opaque_random pad (zero-fuel data init)
+    # that makes every cycle's Bytecode unique, defeating any module dedup. Gas
+    # is set to the GasLimit max for staging headroom (translation cost is not
+    # yet measured); recalibrate down to ~10x measured gas after the first live
+    # run. NOT run live yet — staged for the updated xrpld build.
+    "dos_large_finish_linear": Category(
+        name="dos_large_finish_linear",
+        template=load_template("dos_large_finish_linear"),
+        gas=1_000_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    "dos_large_finish_looped": Category(
+        name="dos_large_finish_looped",
+        template=load_template("dos_large_finish_looped"),
+        gas=1_000_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    "dos_large_finish_many_helpers": Category(
+        name="dos_large_finish_many_helpers",
+        template=load_template("dos_large_finish_many_helpers"),
+        gas=1_000_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
 }
 
 
@@ -668,6 +698,9 @@ ACCUMULATE_DEPTHS = {
     "cache_miss_storm": 500,
     "cache_hit_storm": 500,
     "cache_mixed_storm": 500,
+    "dos_large_finish_linear": 500,
+    "dos_large_finish_looped": 500,
+    "dos_large_finish_many_helpers": 500,
 }
 
 # Purpose tags per case (informational). See PURPOSE_TAGS. A1/A2/A3 and B3 were
@@ -694,6 +727,9 @@ CASE_PURPOSE = {
     "cache_miss_storm": {"dos", "leak"},
     "cache_hit_storm": {"dos", "leak"},
     "cache_mixed_storm": {"dos", "leak"},
+    "dos_large_finish_linear": {"dos"},
+    "dos_large_finish_looped": {"dos"},
+    "dos_large_finish_many_helpers": {"dos"},
 }
 
 CATEGORIES = {

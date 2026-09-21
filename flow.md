@@ -228,7 +228,7 @@ Cancels after expiry.
 
 ## 5. Category registry and WASM_TIMING interpretation
 
-Twenty categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
+Twenty-three categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
 `lifecycles` set (the base plus `accumulate_then_drain` if it opts into the
 burst pattern), a `purpose` set (informational: baseline / correctness / dos /
 leak), and its own `gas` allowance; the fee is charged on the allowance, not on
@@ -258,6 +258,9 @@ place.
 | boundary_float | finish_removes | yes | dos | 50,000 |
 | many_locals | finish_removes | yes | dos | 100,000 |
 | home_le_field_bytecode | finish_removes | yes | dos | 20,000 |
+| dos_large_finish_linear | finish_removes | yes | dos | 1,000,000 |
+| dos_large_finish_looped | finish_removes | yes | dos | 1,000,000 |
+| dos_large_finish_many_helpers | finish_removes | yes | dos | 1,000,000 |
 
 Purpose is informational only — it labels intent (baseline = a trivial control,
 correctness = a specific result/behaviour under test, dos = a wall-time-vs-gas
@@ -297,9 +300,44 @@ against `gas=` (units charged). many_locals is the sharpest live example —
 `time=` per `gas=` stands out from the trivial return_1 baseline is the
 signal.
 
-All twenty behave as intended. Two earlier issues were resolved: oog_compile
-runs out of translation fuel (§6), and update_data_then_success converges once
-its home_le_field field code was corrected (§6).
+**dos_large_finish family** (three templates: dos_large_finish_linear,
+dos_large_finish_looped, dos_large_finish_many_helpers). A controlled trio that
+forks the DoS question the D-group only opens: *which* Wasmi cost dimension is
+underpriced. Under lazy translation a function body translates (and is billed)
+on first call; unreferenced functions never translate; instantiation (data /
+memory init) is charged zero fuel. The three isolate one dimension each by
+holding the others roughly constant:
+
+| case | shape | isolates | translation | execution |
+|---|---|---|---|---|
+| linear | one huge finish body, COUNT straight-line `(i32.const 1)(i32.add)` units, no loop | per-instruction (translate + execute), summed | all COUNT units, once | all COUNT units, once |
+| looped | small body of BODY_UNITS units in a loop of ITERS (executed ≈ linear's COUNT) | per-executed-instruction, translation amortized | body once | body × ITERS |
+| many_helpers | finish calls N tiny one-instruction helpers once each | per-function-entry setup, called N times | N tiny bodies, once each | N entries + N tiny bodies |
+
+The read (all vs the ~8.9 ns/gas anchor in NOTES): linear elevated but looped
+not → translation-dominant per-instruction cost; looped elevated →
+execution-dominant; many_helpers elevated over linear → per-function-entry cost;
+all three elevated → the cost model is globally low; none elevated → honest at
+this shape. Absolute numbers are secondary; the comparison across the three is
+the finding.
+
+Each is a template only to carry a 32-byte `opaque_random` pad in a `(data ...)`
+section, rewritten every EscrowCreate so each cycle's Bytecode is unique
+(defeats any module-store dedup keyed on identical bytes). Data-section init
+costs zero fuel, so the pad does not touch the time/gas measurement. Gas is set
+to the GasLimit max (1,000,000) for staging headroom — translation cost is not
+yet measured — and should be recalibrated down to ~10× measured gas after the
+first live run. Default sizes: linear COUNT=5000 (~15 KB), looped ITERS=100 ×
+BODY_UNITS=50 (~0.5 KB), many_helpers N=5000 (~50 KB); all comfortably under the
+100 KB BytecodeSizeLimit. linear and many_helpers are size-capped by the byte
+limit; looped is capped only by gas.
+
+Twenty of the twenty-three behave as intended and are confirmed live. Two earlier
+issues were resolved: oog_compile runs out of translation fuel (§6), and
+update_data_then_success converges once its home_le_field field code was
+corrected (§6). The three dos_large_finish cases are **staged, not yet run
+live** — they build, validate, and patch offline, but the cost-dimension
+measurement and any gas recalibration wait for the updated xrpld binary.
 
 ## 6. Known limitations / open questions
 
