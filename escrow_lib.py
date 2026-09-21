@@ -700,6 +700,32 @@ CATEGORIES: dict[str, Category] = {
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
+    # -- D-chain: dos_cache_miss_chain. Data-dependent pointer chase over a
+    # Sattolo single-cycle permutation (no prefetch / no MLP) — the strongest
+    # pure-wasm DoS shape. finish builds the chain in linear memory (identity ->
+    # Sattolo, seeded from a per-cycle opaque_random slot) then chases it. Two
+    # presets differ only in working-set size: L1_resident (~8 KB, warm floor,
+    # many passes) vs full_footprint (largest the 1M gas ceiling lets finish
+    # build, ~0.6 MB, one pass). NOTE: on our hosts (M4 Pro ~24 MB, Threadripper
+    # ~128 MB L3) full_footprint is an L2/LLC chase, NOT DRAM — the gas ceiling
+    # caps the buildable working set below any modern LLC, so the ~8.9 ns/gas
+    # DRAM shape is unreachable here (see NOTES). Gas at the 1M ceiling so the
+    # chase runs as long as possible; WASM_TIMING time= is the measurement, not
+    # gas. NOT run live yet — staged for the updated xrpld.
+    "chain_L1_resident": Category(
+        name="chain_L1_resident",
+        template=load_template("chain_L1_resident"),
+        gas=1_000_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    "chain_full_footprint": Category(
+        name="chain_full_footprint",
+        template=load_template("chain_full_footprint"),
+        gas=1_000_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
 }
 
 
@@ -733,6 +759,8 @@ ACCUMULATE_DEPTHS = {
     "inst_data": 500,
     "inst_elem": 500,
     "inst_locals": 500,
+    "chain_L1_resident": 500,
+    "chain_full_footprint": 500,
 }
 
 # Purpose tags per case (informational). See PURPOSE_TAGS. A1/A2/A3 and B3 were
@@ -765,6 +793,8 @@ CASE_PURPOSE = {
     "inst_data": {"dos"},
     "inst_elem": {"dos"},
     "inst_locals": {"dos"},
+    "chain_L1_resident": {"dos"},
+    "chain_full_footprint": {"dos"},
 }
 
 CATEGORIES = {

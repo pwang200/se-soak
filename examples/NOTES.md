@@ -588,3 +588,56 @@ sub-cases the trivial finish makes the combined number instantiation-dominant, s
 no immediate action. FUTURE INSTRUMENTATION IMPROVEMENT: split instantiate vs
 execute (and vs lazy-translation) time in WASM_TIMING_FINISH so instantiation cost
 is attributable directly rather than inferred from a trivial-finish control.
+
+Cache-miss chain (2026-09-21): dos_cache_miss_chain = chain_L1_resident /
+chain_full_footprint:
+Two DoS categories reproducing the dependent-pointer-chase shape (the "8.9 ns/gas"
+memory-hierarchy attack from another session). finish builds a random permutation
+in linear memory and chases it: each load's address is the previous load's value,
+so no prefetch and no memory-level parallelism — cost tracks the cache level the
+working set lands in. All finish_removes, purpose=dos, accumulate depth 500,
+template-based (opaque_random SEED slot, not a shipped permutation). Staged; NOT
+run live yet. Behavior confirmed offline against a Python reference of the exact
+algorithm (single Sattolo cycle, one-pass covers all N, returns >0 -> tesSUCCESS);
+the wasm itself is wat2wasm + wasm-validate clean (no offline wasm runtime here).
+
+Shape: three phases in finish, all rebuilt every Finish (fresh zeroed memory):
+  1. identity fill p[i]=i.
+  2. Sattolo shuffle (uniform random SINGLE cycle): for i=N-1 downto 1, j=rand()%i,
+     swap p[i],p[j]. Single n-cycle guarantees one pass touches every node once.
+  3. chase: cur=p[cur], T times. full_footprint T=N (one pass, each load a fresh
+     line); L1_resident T>>N (many warm passes, the floor).
+xorshift32 seeded from a 32-byte opaque_random slot at offset 0 that the patcher
+rewrites per cycle -> fresh permutation each Finish (defeats cross-Finish address
+learning). No new patcher role — opaque_random on the seed is enough.
+Presets: chain_L1_resident N=2048 stride=4 (~8 KB, L1) T=50000; chain_full_footprint
+N=10000 stride=64 (~0.6 MB) T=10000. Blobs ~300 B (array built at runtime, not
+shipped), Create fee ~1,600 drops. Gas at the 1M ceiling (chase as long as
+possible); WASM_TIMING time= is the measurement, not gas.
+
+KEY FINDING — DRAM-latency wasm DoS is effectively UNREACHABLE on this build:
+The wasmi 2.0.0 fuel model (verified in source) is 1 fuel per operator (loads,
+stores, arith, const, local.get/set, br_if all = 1; only nop/drop/block/loop/
+return/else/end = 0; costs.rs default_cost macro), gas maps 1:1 to fuel, ceiling
+1,000,000, and bulk memory is disabled (vm.rs wasm_bulk_memory(false)) so the array
+must be built with per-element stores. Building the chain costs ~78 fuel/node
+(identity fill + Sattolo swap's random accesses + one chase step), so the buildable
+working set caps at ~12,000 nodes (~0.6-0.8 MB) under the 1M ceiling. Shipping a
+bigger array as a data segment doesn't help (100 KB module cap -> ~90 KB array),
+and the 8 MiB memory cap can't be FILLED within gas anyway. On the test hosts
+(M4 Pro ~24 MB L3, Threadripper 9960X ~128 MB L3) a sub-MB footprint is an L2/LLC
+chase, never DRAM. To read ~8.9 ns/gas you need ~130 ns dependent loads (DRAM),
+which requires a working set past the LLC — and the attacker cannot afford the
+gas to build one. So the real answer to "does this shape reach 8.9 ns/gas on our
+hosts" is NO: the gas ceiling caps the attacker's working set below any modern
+LLC. That is itself the useful result — this pure-wasm shape is bounded here.
+
+OPEN QUESTION — where did 8.9 ns/gas come from? It is inconsistent with the above.
+Possibilities (flagged, not chased): the other session assumed a different (higher
+or absent) gas ceiling; ran on a smaller-cache machine where a ~0.1-0.6 MB working
+set already exceeds the LLC; used a shape we have not seen (e.g. a data-segment
+array on a small-LLC host, or measured translation/instantiation rather than the
+chase); or a different fuel/gas mapping. Worth reconciling before treating 8.9 as
+a target for this build. For our hosts, expect chain_full_footprint well below 8.9
+ns/gas and chain_L1_resident far below that (the floor); the L1-vs-full ratio is
+the deliverable, and the absolute confirmation waits for the live run.

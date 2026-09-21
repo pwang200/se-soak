@@ -228,7 +228,7 @@ Cancels after expiry.
 
 ## 5. Category registry and WASM_TIMING interpretation
 
-Twenty-six categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
+Twenty-eight categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
 `lifecycles` set (the base plus `accumulate_then_drain` if it opts into the
 burst pattern), a `purpose` set (informational: baseline / correctness / dos /
 leak), and its own `gas` allowance; the fee is charged on the allowance, not on
@@ -264,6 +264,8 @@ place.
 | inst_data | finish_removes | yes | dos | 10,000 |
 | inst_elem | finish_removes | yes | dos | 10,000 |
 | inst_locals | finish_removes | yes | dos | 10,000 |
+| chain_L1_resident | finish_removes | yes | dos | 1,000,000 |
+| chain_full_footprint | finish_removes | yes | dos | 1,000,000 |
 
 Purpose is informational only — it labels intent (baseline = a trivial control,
 correctness = a specific result/behaviour under test, dos = a wall-time-vs-gas
@@ -368,13 +370,44 @@ WASM_TIMING_FINISH does **not** split instantiate from execute time (one combine
 `time=`); trivial finish keeps it instantiation-dominant, so no immediate action
 (see NOTES for the instrumentation-improvement flag).
 
-Twenty of the twenty-six behave as intended and are confirmed live. Two earlier
+**dos_cache_miss_chain family** (two presets: chain_L1_resident,
+chain_full_footprint). A data-dependent pointer chase — the strongest known
+pure-wasm DoS shape. finish builds a random permutation in linear memory and then
+follows it, so each load's address comes from the previous load: no prefetch, no
+memory-level parallelism, cost set by the memory-hierarchy level the working set
+lands in. Three phases, all rebuilt every Finish (fresh zeroed memory): identity
+fill `p[i]=i`, a Sattolo shuffle into a single random n-cycle (so one pass visits
+every node once), then the chase. The xorshift32 seed is a 32-byte
+`opaque_random` slot the patcher rewrites per cycle, so every Finish gets a fresh
+permutation — no new patcher role.
+
+| preset | nodes × stride | footprint | traversal | probes |
+|---|---|---|---|---|
+| chain_L1_resident | 2048 × 4 B | ~8 KB | many passes (T=50000) | warm-cache floor (stays in L1 on both hosts) |
+| chain_full_footprint | 10000 × 64 B | ~0.6 MB | one pass (T=N) | largest working set the gas ceiling allows |
+
+Naming is by shape, not cache level: on the test hosts (M4 Pro ~24 MB L3,
+Threadripper 9960X ~128 MB L3) chain_full_footprint's ~0.6 MB is an L2/LLC chase,
+**not** DRAM-evicting. That is a finding, not a limitation of the code: wasmi
+charges 1 fuel per operator and forbids bulk memory, so building the array costs
+~78 fuel per node (identity + Sattolo + one chase step), which caps the buildable
+working set at ~12,000 nodes under the 1M gas ceiling — well below any modern LLC.
+So the ~8.9 ns/gas DRAM shape from the earlier session is effectively unreachable
+on this build: the attacker cannot afford the memory to make it work (see NOTES
+"cache-miss chain" for the full argument and the open question about that
+measurement). The L1-vs-full ratio still quantifies how much the memory hierarchy
+matters here. Gas is at the 1M ceiling so the chase runs as long as possible;
+WASM_TIMING `time=` is the measurement, not gas. Blobs are ~300 bytes (the array
+is built at runtime, not shipped), so Create fees are ~1,600 drops.
+
+Twenty of the twenty-eight behave as intended and are confirmed live. Two earlier
 issues were resolved: oog_compile runs out of translation fuel (§6), and
 update_data_then_success converges once its home_le_field field code was
-corrected (§6). The three dos_large_finish and three dos_expensive_instantiation
-cases are **staged, not yet run live** — they build, validate, and patch offline,
-but the cost measurements and any gas recalibration wait for the updated xrpld
-binary.
+corrected (§6). The three dos_large_finish, three dos_expensive_instantiation, and
+two dos_cache_miss_chain cases are **staged, not yet run live** — they build,
+validate, and patch offline (the chase's single-cycle Sattolo and tesSUCCESS
+return are confirmed against a Python reference of the same algorithm), but the
+cost measurements and any gas recalibration wait for the updated xrpld binary.
 
 ## 6. Known limitations / open questions
 
