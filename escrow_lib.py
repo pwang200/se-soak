@@ -671,6 +671,35 @@ CATEGORIES: dict[str, Category] = {
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
+    # -- D-inst: dos_expensive_instantiation. Pack maximum ZERO-FUEL
+    # instantiation work (data copy / table materialization / frame local-init)
+    # into a legal blob behind a trivial finish, so per-Finish wall-clock is
+    # instantiation-dominant while the attacker pays only the Create fee. xrpld
+    # re-instantiates the module every Finish, so the cost recurs. Each is a
+    # template only to carry an opaque_random pad (zero-fuel) for per-cycle
+    # uniqueness. Gas is small (finish is trivial); WASM_TIMING time= is the
+    # measurement, not gas. NOT run live yet — staged for the updated xrpld.
+    "inst_data": Category(
+        name="inst_data",
+        template=load_template("inst_data"),          # ~90 KB (data) copy
+        gas=10_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    "inst_elem": Category(
+        name="inst_elem",
+        template=load_template("inst_elem"),          # 1024 table entries
+        gas=10_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
+    "inst_locals": Category(
+        name="inst_locals",
+        template=load_template("inst_locals"),        # 30000 frame locals
+        gas=10_000,
+        lifecycle=FINISH_REMOVES,
+        expected_finish_result="tesSUCCESS",
+    ),
 }
 
 
@@ -701,6 +730,9 @@ ACCUMULATE_DEPTHS = {
     "dos_large_finish_linear": 500,
     "dos_large_finish_looped": 500,
     "dos_large_finish_many_helpers": 500,
+    "inst_data": 500,
+    "inst_elem": 500,
+    "inst_locals": 500,
 }
 
 # Purpose tags per case (informational). See PURPOSE_TAGS. A1/A2/A3 and B3 were
@@ -730,6 +762,9 @@ CASE_PURPOSE = {
     "dos_large_finish_linear": {"dos"},
     "dos_large_finish_looped": {"dos"},
     "dos_large_finish_many_helpers": {"dos"},
+    "inst_data": {"dos"},
+    "inst_elem": {"dos"},
+    "inst_locals": {"dos"},
 }
 
 CATEGORIES = {

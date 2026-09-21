@@ -523,3 +523,68 @@ template (run_soak.py needs_patch), so these plumb through identically to the
 cache_le_pattern / keylet_probe templates; opaque_random needs no populated/ index
 or pool accounts. Live measurement (the time/gas comparison + gas recalibration)
 is deferred to the updated xrpld binary.
+
+Expensive instantiation (2026-09-21): dos_expensive_instantiation = inst_data /
+inst_elem / inst_locals:
+Three DoS categories that probe INSTANTIATION cost — work Wasmi charges ZERO fuel
+and that xrpld repeats on every EscrowFinish (run() builds a fresh engine + module
++ store and calls instantiate_and_start per invocation; vm.rs). Each pairs a
+maximally-expensive-at-instantiation module with trivial finish() { return 1 }, so
+WASM_TIMING time= is instantiation-dominant. All finish_removes, purpose=dos,
+accumulate depth 500, template-based (opaque_random pad for per-cycle uniqueness).
+Staged for a later xrpld build; NOT run live yet.
+
+Caps looked up (deliverable 1) — the two the prompt asked for are NOT xrpld
+constants; xrpld sets no max-locals/max-functions. The real binding limits:
+- MAX_MEMORY_PAGES = 128 (8 MiB), MAX_TABLE_ELEMENTS = 1024: crates/xrpl-wasm-vm/
+  src/vm.rs (store_limits + preflight). The vm.rs MAX_TABLE_ELEMENTS comment is the
+  exact "wasmi materializes every one inside instantiate_and_start, before the
+  guest's first instruction, so no gas charge can reach the cost" line the task
+  quotes — inst_elem reproduces that shape directly.
+- max locals per function = 30,000. wasmi 2.0.0 hard translator limit
+  LocalsRegistry::LOCAL_VARIABLES_MAX (engine/translator/func/locals.rs), enforced
+  in register() at translation time, config-independent (strict-greater, so 30000
+  itself is allowed). NOT the 50,000 seen in wasmparser limits.rs / wasmi
+  limits.rs MAX_FUNC_LOCAL_COUNT — that 50,000 is an OPT-IN EnforcedLimit and
+  xrpld does not enable enforced limits (vm.rs sets only ignore_custom_sections
+  etc.). So 50,000 is inert; 30,000 binds. (User caught this — I had cited 50,000.)
+- max functions per module = no active wasmi limit in xrpld. wasmi has
+  MAX_FUNC_COUNT = 1,000,000 but only as an EnforcedLimit (inert here); the
+  effective ceiling is the 100 KB module-size cap (~30k functions). So "90% of the
+  functions cap" is not a usable sizing rule; the 100 KB module size is the real
+  constraint for function-/data-heavy blobs.
+
+Sizing (all offline-built, wat2wasm + wasm-validate, < 100 KB):
+- inst_data: 90000-byte active (data ...) (~90% of the 100 KB cap) copied to linear
+  memory (min 2 pages) at instantiation. wasm 90063 B, Create fee ~450,415 drops
+  (~0.45 XRP at base=10). Whole data segment IS the opaque_random slot (payload +
+  dedup). Isolates memory-init copy cost.
+- inst_elem: (table 1024 funcref) + elem filling all 1024 -> ONE no-op dummy (elem
+  indices may repeat; wasmi materializes each slot regardless of target, so N dummy
+  functions required = 1). wasm 1139 B, Create fee ~5,795 drops. 32-byte pad.
+  Isolates table-materialization cost.
+- inst_locals: 30000 i32 locals in finish, trivial body, locals NOT touched. wasm
+  95 B (locals collapse to a few bytes in the binary; the cost is runtime frame
+  zeroing, not size), Create fee ~575 drops. Do NOT add local.get+drop per local:
+  declared locals are frame-zeroed at entry whether used or not (and wat2wasm never
+  drops them), so touching them would inject ~2*30000 translated+executed body
+  instructions and make time= translation-dominant, not frame-init-dominant — plus
+  blow past 100 KB. Overlaps existing many_locals (also 30000) but that one calls a
+  helper in a loop 100x; inst_locals is a single-entry regression test for the
+  in-flight per-frame-local-init fuel PR (once it lands, time_us/gas here drops).
+  Isolates per-frame local-slot-zeroing cost. 32-byte pad.
+
+Reference / read-out: measure time_us/gas per sub-case from WASM_TIMING_FINISH and
+compare against the ~8.9 ns/gas pure-wasm anchor; above 8.9 is stronger DoS than a
+pure wasm loop. Gas allowance is small (10,000) because finish is trivial and
+instantiation is unbilled — gas used is near-zero; time= is the whole finding.
+
+WASM_TIMING interpretation aside (deliverable check): WASM_TIMING_FINISH does NOT
+split instantiation from execution. The timing patch (commit e3027675a4 on branch
+se-soak / 929b1d8215 on supported_May_2_time_log; EscrowFinish.cpp) wraps the
+whole apply window (t_apply_start..t_apply_end around the wasm run()) into one
+time= microsecond number, combining compile + instantiate + execute. For these
+sub-cases the trivial finish makes the combined number instantiation-dominant, so
+no immediate action. FUTURE INSTRUMENTATION IMPROVEMENT: split instantiate vs
+execute (and vs lazy-translation) time in WASM_TIMING_FINISH so instantiation cost
+is attributable directly rather than inferred from a trivial-finish control.

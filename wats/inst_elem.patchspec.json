@@ -1,0 +1,10 @@
+{
+  "template": "inst_elem",
+  "slots": [
+    {
+      "name": "pad",
+      "sentinel": "1D57E1E1000102030405060708090A0B0C0D0E0F101112131415161718191A1B",
+      "role": "opaque_random"
+    }
+  ]
+}

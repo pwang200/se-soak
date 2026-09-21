@@ -1,0 +1,13 @@
+{
+  "template": "inst_locals",
+  "length": 95,
+  "slots": [
+    {
+      "name": "pad",
+      "offset": 63,
+      "length": 32,
+      "role": "opaque_random",
+      "params": {}
+    }
+  ]
+}

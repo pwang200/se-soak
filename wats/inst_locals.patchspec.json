@@ -1,0 +1,10 @@
+{
+  "template": "inst_locals",
+  "slots": [
+    {
+      "name": "pad",
+      "sentinel": "1D5710CA000102030405060708090A0B0C0D0E0F101112131415161718191A1B",
+      "role": "opaque_random"
+    }
+  ]
+}

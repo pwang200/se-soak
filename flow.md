@@ -228,7 +228,7 @@ Cancels after expiry.
 
 ## 5. Category registry and WASM_TIMING interpretation
 
-Twenty-three categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
+Twenty-six categories (escrow_lib.CATEGORIES). Each declares a base `lifecycle`, a
 `lifecycles` set (the base plus `accumulate_then_drain` if it opts into the
 burst pattern), a `purpose` set (informational: baseline / correctness / dos /
 leak), and its own `gas` allowance; the fee is charged on the allowance, not on
@@ -261,6 +261,9 @@ place.
 | dos_large_finish_linear | finish_removes | yes | dos | 1,000,000 |
 | dos_large_finish_looped | finish_removes | yes | dos | 1,000,000 |
 | dos_large_finish_many_helpers | finish_removes | yes | dos | 1,000,000 |
+| inst_data | finish_removes | yes | dos | 10,000 |
+| inst_elem | finish_removes | yes | dos | 10,000 |
+| inst_locals | finish_removes | yes | dos | 10,000 |
 
 Purpose is informational only — it labels intent (baseline = a trivial control,
 correctness = a specific result/behaviour under test, dos = a wall-time-vs-gas
@@ -332,12 +335,46 @@ BODY_UNITS=50 (~0.5 KB), many_helpers N=5000 (~50 KB); all comfortably under the
 100 KB BytecodeSizeLimit. linear and many_helpers are size-capped by the byte
 limit; looped is capped only by gas.
 
-Twenty of the twenty-three behave as intended and are confirmed live. Two earlier
+**dos_expensive_instantiation family** (three templates: inst_data, inst_elem,
+inst_locals). Where dos_large_finish probes translation and execution, this trio
+probes *instantiation*: work that Wasmi charges **zero fuel** and that xrpld
+repeats on every Finish, because `run()` builds a fresh engine, module, and
+store and calls `instantiate_and_start` per invocation. Each pairs a maximally
+expensive-at-instantiation module with a trivial `finish() { return 1 }`, so the
+combined WASM_TIMING `time=` is instantiation-dominant.
+
+| case | packs | isolates | ~size |
+|---|---|---|---|
+| inst_data | a ~90 KB active `(data ...)` copied into linear memory at instantiation | memory-init copy cost | 90 KB (~90% of the 100 KB module cap) |
+| inst_elem | `(table 1024 funcref)` with an elem segment filling every entry (all → one no-op dummy) | table-entry materialization (1024 slots) | ~1.1 KB |
+| inst_locals | 30,000 i32 locals in finish, trivial body, locals untouched | per-frame local-slot zeroing at entry | ~0.1 KB |
+
+The caps are xrpld's / Wasmi's real ones: memory 128 pages, table 1024 elements
+(both at crates/xrpl-wasm-vm/src/vm.rs), and locals 30,000 (wasmi 2.0.0
+`LocalsRegistry::LOCAL_VARIABLES_MAX`, a hard translator limit — not the inert
+50,000 EnforcedLimit). inst_elem needs only **one** dummy function: an elem
+segment is a list of indices that may repeat and Wasmi materializes every slot
+regardless of target. inst_locals does **not** touch its locals on purpose —
+declared locals are frame-zeroed whether used or not, so touching them would add
+translated/executed body instructions and make the number translation-dominant
+instead (it also overlaps the existing many_locals, which sits at the same 30,000
+but calls a helper in a loop; inst_locals is the single-entry regression test for
+the in-flight per-frame-local-init fuel PR). Read all three against the ~8.9
+ns/gas anchor: above it is stronger DoS than a pure wasm loop. Gas is small
+(10,000) since finish is trivial and instantiation is unbilled; `time=` is the
+measurement. Each carries an `opaque_random` pad for per-cycle uniqueness —
+inst_data's whole data segment is the pad, the other two carry a 32-byte pad.
+WASM_TIMING_FINISH does **not** split instantiate from execute time (one combined
+`time=`); trivial finish keeps it instantiation-dominant, so no immediate action
+(see NOTES for the instrumentation-improvement flag).
+
+Twenty of the twenty-six behave as intended and are confirmed live. Two earlier
 issues were resolved: oog_compile runs out of translation fuel (§6), and
 update_data_then_success converges once its home_le_field field code was
-corrected (§6). The three dos_large_finish cases are **staged, not yet run
-live** — they build, validate, and patch offline, but the cost-dimension
-measurement and any gas recalibration wait for the updated xrpld binary.
+corrected (§6). The three dos_large_finish and three dos_expensive_instantiation
+cases are **staged, not yet run live** — they build, validate, and patch offline,
+but the cost measurements and any gas recalibration wait for the updated xrpld
+binary.
 
 ## 6. Known limitations / open questions
 

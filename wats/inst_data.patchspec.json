@@ -1,0 +1,11 @@
+{
+  "template": "inst_data",
+  "slots": [
+    {
+      "name": "pad",
+      "sentinel": "1D57DA7A000102030405060708090A0B0C0D0E0F101112131415161718191A1B",
+      "length": 90000,
+      "role": "opaque_random"
+    }
+  ]
+}

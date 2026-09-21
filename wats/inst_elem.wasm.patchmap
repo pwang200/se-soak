@@ -1,0 +1,13 @@
+{
+  "template": "inst_elem",
+  "length": 1139,
+  "slots": [
+    {
+      "name": "pad",
+      "offset": 1107,
+      "length": 32,
+      "role": "opaque_random",
+      "params": {}
+    }
+  ]
+}
