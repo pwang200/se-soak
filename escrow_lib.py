@@ -653,21 +653,21 @@ CATEGORIES: dict[str, Category] = {
     "dos_large_finish_linear": Category(
         name="dos_large_finish_linear",
         template=load_template("dos_large_finish_linear"),
-        gas=1_000_000,
+        gas=250_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
     "dos_large_finish_looped": Category(
         name="dos_large_finish_looped",
         template=load_template("dos_large_finish_looped"),
-        gas=1_000_000,
+        gas=50_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
     "dos_large_finish_many_helpers": Category(
         name="dos_large_finish_many_helpers",
         template=load_template("dos_large_finish_many_helpers"),
-        gas=1_000_000,
+        gas=300_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
@@ -682,21 +682,21 @@ CATEGORIES: dict[str, Category] = {
     "inst_data": Category(
         name="inst_data",
         template=load_template("inst_data"),          # ~90 KB (data) copy
-        gas=10_000,
+        gas=1_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
     "inst_elem": Category(
         name="inst_elem",
         template=load_template("inst_elem"),          # 1024 table entries
-        gas=10_000,
+        gas=1_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
     "inst_locals": Category(
         name="inst_locals",
         template=load_template("inst_locals"),        # 30000 frame locals
-        gas=10_000,
+        gas=1_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),
@@ -715,7 +715,7 @@ CATEGORIES: dict[str, Category] = {
     "chain_L1_resident": Category(
         name="chain_L1_resident",
         template=load_template("chain_L1_resident"),
-        gas=1_000_000,
+        gas=650_000,
         lifecycle=FINISH_REMOVES,
         expected_finish_result="tesSUCCESS",
     ),

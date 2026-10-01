@@ -711,3 +711,55 @@ now emits the LCG build (the 2026-09-21 Sattolo description above is historical)
 Caveat: full also does more build writes (higher gas), but the build is sequential
 and fast so the 3.7x is chase-dominated; ledger_seq/open flags will let a trial run
 isolate the consensus pass cleanly.
+
+Trial DoS measurements + gas recalibration (2026-10-01, rebuilt binary @ HEAD
+6973159c7e with ledger_seq+open flags):
+WASM_TIMING_FINISH now logs each finish TWICE, tagged: open=true (apply vs the open
+ledger, when the tx is first judged) and open=false (apply after consensus, building
+the next ledger), both with ledger_seq. open=false is the canonical per-tx cost
+(deterministic ledger-build pass); for heavy cases it's the COSTLIER of the two
+(e.g. chain_full open=true 1978 us vs open=false 2636 us), so using it is also the
+conservative choice. (pwang note: preflight/open-ledger apply can run MORE than
+twice per tx; join by ledger_seq+open, don't assume a fixed count.)
+
+Trial run: serial, 8 threads, 5 min, 8 DoS cases round-robin, 304 finishes (38/case),
+0 unexpected. Per-case open=false median time / gas:
+  case                           gas      t_false  t_true   ns/gas(raw)
+  dos_large_finish_many_helpers  136,671  1167 us   845 us   8.5
+  dos_large_finish_looped         23,520   214 us   192 us   9.1
+  dos_large_finish_linear        115,030   728 us   478 us   6.3
+  chain_full_footprint           623,563  2636 us  1978 us   4.2
+  chain_L1_resident              308,143  1141 us   690 us   3.7
+  inst_locals                        58    262 us   214 us   (gas tiny)
+  inst_elem                          30    220 us   194 us   (gas tiny)
+  inst_data                          30    196 us   236 us   (gas tiny)
+There is a ~196 us FIXED per-finish-invocation floor (min open=false median), so RAW
+ns/gas is floor-contaminated for small/medium-gas cases. The real signal is in the
+DIFFERENTIALS (the trio was designed for exactly this):
+
+RANKED underbilled cost dimensions (wall time not reflected in gas):
+  1. per-function-ENTRY ~20 ns/gas  (many_helpers - linear: dt=439us, dgas=21,641).
+     SHARPEST, ~2.3x the 8.9 anchor. First-call translation + frame setup per entry
+     is the most underbilled pure-wasm dimension. (Guarded above avg<40 B/func, but
+     within the allowed regime this holds.)
+  2. per-instruction TRANSLATION ~5.6 ns/gas  (linear - looped: dt=514us, dgas=91,510).
+  3. cache-miss CHASE ~4 ns/gas  (chain absolute; 1 MB L2-bound, below the 8.9 DRAM
+     figure — DRAM unreachable here, see "cache-miss chain"). L1-vs-full ratio 3.7x.
+  4. per-executed-instruction ~0.8 ns/gas  (looped, floor-corrected). CHEAPEST;
+     raw execution is well-billed.
+  5. INSTANTIATION (inst_*): unbilled ABSOLUTE microseconds, gas ~= 0. frame-local
+     init +65 us over floor (30000 locals, gas 58), table materialization +24 us
+     (1024 entries), data-copy ~0 (90 KB is fast). Near-infinite ns/gas but small
+     absolute; frame-local-init supports the in-flight per-frame-local fuel PR.
+Takeaway: the two sharp findings are per-function-ENTRY (~20 ns/gas) and
+frame-local-INIT (unbilled us); both are "work the gas model doesn't charge for."
+
+Gas recalibration (from the staging max-headroom values to ~2x measured; gas is
+DETERMINISTIC for these cases — fixed instruction/loop counts — so 2x is safe;
+capped at the 1M ceiling, floor 1000). All 8 re-confirmed tesSUCCESS at the new
+allowances:
+  dos_large_finish_linear  1M -> 250K    dos_large_finish_looped  1M -> 50K
+  dos_large_finish_many_helpers 1M -> 300K
+  inst_data/elem/locals    10K -> 1K     chain_L1_resident  1M -> 650K
+  chain_full_footprint     1M (kept; 2x exceeds ceiling)
+This cuts per-finish fees (1 drop/gas) for accumulate/soak runs where fee x N matters.
