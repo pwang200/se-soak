@@ -470,3 +470,63 @@ max-headroom staging values) are the next step; see NOTES 2026-10-01.
   just the active slice; slow with the 1M-account file.
 - **tefMAX_LEDGER cannot occur** (no LastLedgerSequence is set); it is in
   the retry set for completeness only.
+
+## 7. Leak soak (how to run)
+
+The DoS work (§5) measures per-tx wall time. The leak dimension asks a different
+question: does xrpld RSS grow without bound over a long run? Three tools, all in
+this repo, no chat context needed:
+
+- `scripts/rippled_memory_sampler.py` — samples xrpld RSS / VSZ / thread count /
+  ledger_seq to a CSV (`<run-dir>/xrpld_memory.csv`). Cross-platform (psutil),
+  survives xrpld and sampler restarts, drift-free schedule.
+- `run_soak.py` — drives the workload (the same patterns/categories as the DoS
+  work).
+- `analyze_leak.py` — joins the sampler CSV + run_soak.log + soak.csv and reports
+  the RSS slope once the node reaches steady state, plus a per-window slope
+  (decelerating = settling, steady = leak) and the accumulate drain baselines.
+
+**The gate: history must be bounded, or RSS growth is meaningless.** Standalone
+xrpld keeps FULL ledger history until `online_delete` (see xrpld.cfg `[node_db]`,
+default 512) rotates — and rotation only fires once the node has ~2×online_delete
+ledgers AND the SHAMapStore thread runs at a normal pace. Before that, RSS rises
+with ledger count even for empty ledgers (~25 KB/ledger observed), which is NOT a
+leak. **Verify rotation engages on your build before trusting a soak**: close past
+~1,100 ledgers at normal pace and confirm `server_info.complete_ledgers` prunes
+(earliest advances past 2) and the log shows `SHAMapStore ... finished rotation`.
+Rotation was seen working on earlier builds and NOT firing on the 2026-10-01 build
+(see NOTES), so this check is mandatory per-binary.
+
+**Run it** (each long-running piece in tmux/nohup; a real soak is hours):
+
+```
+# 1. ledgers advancing
+python3 ledger_ticker.py --interval 2
+
+# 2. RSS sampler (1 Hz is plenty; writes into the run dir)
+python3 scripts/rippled_memory_sampler.py --interval 1 \
+    --output runs/leak1/xrpld_memory.csv
+
+# 3. the workload — pipeline for per-invocation leak at high throughput...
+python3 run_soak.py --pattern pipeline --categories return_1 \
+    --accounts-per-thread 50 --in-flight-per-account 2 --threads 8 \
+    --duration 21600 --run-dir runs/leak1
+#    ...or accumulate for per-live-object state (create N, drain N, repeat):
+# python3 run_soak.py --pattern accumulate --categories return_1,chain_full_footprint \
+#     --accumulate-depth 2000 --threads 4 --duration 21600 --run-dir runs/leak1
+
+# 4. verdict (drop the pre-rotation ramp with --warmup-ledgers)
+python3 analyze_leak.py runs/leak1 --warmup-ledgers 1100 --windows 8
+```
+
+**Reading the result.** After warmup (past rotation), a flat slope that does not
+shrink window-over-window is the leak; a decelerating slope is caches/history
+filling and settling. Run a trivial case (`return_1`) and a heavy one
+(`chain_full_footprint`, `inst_data`) separately: equal bytes/finish means the leak
+is in the tx/ledger path, more for the heavy case means a wasm teardown leak.
+
+**If rotation will not engage on your build** (history stays unbounded), fall back
+to a control: run an *empty-ledger baseline* (sampler + ticker, no soak) to get
+bytes/ledger with zero txs, then the escrow soak at the same ledger rate; the leak
+is the DIFFERENCE in bytes/ledger, not the raw slope. (A no-wasm Payment control
+would be cleaner but the driver is escrow-only today.)

@@ -763,3 +763,39 @@ allowances:
   inst_data/elem/locals    10K -> 1K     chain_L1_resident  1M -> 650K
   chain_full_footprint     1M (kept; 2x exceeds ceiling)
 This cuts per-finish fees (1 drop/gas) for accumulate/soak runs where fee x N matters.
+
+Leak-dimension toolchain + online_delete finding (2026-10-01):
+The leak soak is now runnable context-free from the repo: scripts/
+rippled_memory_sampler.py (already existed — RSS/VSZ/threads/ledger_seq to CSV,
+xplatform, restart-surviving) + run_soak.py (workload) + analyze_leak.py (NEW:
+joins the sampler CSV + run_soak.log + soak.csv, reports steady-state RSS slope,
+per-window slope, accumulate drain baselines). flow.md section 7 has the runbook.
+(A throwaway sample_mem.py I wrote before finding scripts/rippled_memory_sampler.py
+was deleted — use the scripts/ one.)
+
+KEY finding — online_delete (history rotation) is the gate, and it's flaky:
+Standalone xrpld keeps FULL ledger history until online_delete (xrpld.cfg
+[node_db], =512) rotates, which needs ~2x512=1024 ledgers AND the SHAMapStore
+thread firing at normal pace. Observed:
+- EARLIER builds (Sep 16-17 debug.log): rotation fired every 512 ledgers
+  ("SHAMapStore ... finished rotation", 2-515 -> 3-515, 3-1027 -> 515-1027, etc.),
+  bounding history to ~512-1024 ledgers.
+- 2026-10-01 release build: rotation did NOT fire — rapidly advanced to 1150
+  ledgers (outran the background thread) AND then held at 2s pace to 1169, still
+  complete_ledgers=2-1169, no rotation logged this session. Cause not root-caused
+  (could be the new binary, a ledger_history/validated-seq interaction, or needs
+  longer). So: VERIFY rotation engages per-binary before a long soak.
+Consequence: on a full-history node RSS grows with LEDGER COUNT regardless of
+content (~25 KB per EMPTY ledger measured: 800 empty closes grew RSS ~20 MB). So
+raw "RSS climbs over a soak" is EXPECTED, not a leak. The 2026-10-01 accumulate
+validation (RSS 477->528 MB over 5002 finishes, post-drain baseline creeping every
+burst) is this retention, not a confirmed leak — analyze_leak's per-window slope
+showed DECELERATION (832->264 MB/hour), i.e. settling, not steady growth.
+
+Method (flow.md section 7): sampler + soak for hours PAST the rotation plateau,
+then analyze_leak --warmup-ledgers <past rotation> and read the post-plateau slope;
+flat (and not shrinking window-over-window) = leak, decelerating = history/cache
+settling. Separate trivial (return_1) from heavy (chain_full/inst_data) to tell a
+tx/ledger-path leak from a wasm-teardown leak. If rotation won't engage, fall back
+to an empty-ledger control and difference the bytes/ledger. Long runs go on the
+Ubuntu box (my background tasks cap at 10 min); everything needed is in the repo.
