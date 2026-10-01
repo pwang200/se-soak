@@ -2,39 +2,37 @@
 """dos_cache_miss_chain — generate the cache-miss pointer-chase presets.
 
 The strongest known pure-wasm DoS shape: a data-dependent pointer chase over a
-random permutation, so every load depends on the previous one (no memory-level
-parallelism, no prefetch) and cost is set by the memory-hierarchy level the
+single-cycle permutation, so every load depends on the previous one (no prefetch,
+no memory-level parallelism) and cost is set by the memory-hierarchy level the
 working set falls into. Emits two presets from one template, differing only in
 working-set size:
 
   chain_L1_resident     small dense array (~8 KB) that stays in L1; the warm-cache
-                        floor. Traversed many passes for a stable measurement.
-  chain_full_footprint  the largest array the 1M gas ceiling lets finish BUILD
-                        in-wasm (~0.5-0.7 MB with Sattolo), traversed one pass so
-                        every load is a fresh line. Named by shape, not "L3": on
-                        our hosts (M4 Pro ~24 MB L3, Threadripper 9960X ~128 MB
-                        L3) this footprint is an L2/LLC chase, NOT DRAM-evicting.
-                        DRAM latency is unreachable here — the gas ceiling caps
-                        the attacker's working set well below any modern LLC (see
-                        NOTES "cache-miss chain").
+                        floor, traversed many passes for a stable measurement.
+  chain_full_footprint  a larger array (~1 MB) traversed one cold pass so every
+                        load is a fresh line. Named by shape, not cache level: on
+                        our hosts (M4 Pro ~16 MB L2, Threadripper 9960X 1 MB L2 /
+                        128 MB L3) 1 MB is an L2/L3 chase, not DRAM; the gas
+                        ceiling (~16 gas/iteration, so build+chase caps the
+                        buildable set near 30K nodes) keeps it below any LLC
+                        (see NOTES "cache-miss chain").
 
-finish() has three phases, all in linear memory (a fresh zeroed memory every
-Finish, so it is rebuilt each time):
-  1. identity fill:  p[i] = i for i in 0..N.
-  2. Sattolo shuffle (a uniformly random SINGLE cycle / Hamiltonian permutation):
-     for i = N-1 downto 1: j = rand() mod i; swap p[i], p[j]. Guarantees one
-     n-cycle, so a one-pass traversal touches every node exactly once.
-  3. traverse: cur = p[cur], T times. full_footprint uses T = N (one pass);
-     L1_resident uses T >> N (many warm passes).
-The xorshift32 PRNG is seeded from a 32-byte opaque_random slot at offset 0 that
-the patcher rewrites every EscrowCreate, so each cycle gets a fresh permutation
-(defeats per-address pattern learning across Finishes). No new patcher role —
-the existing opaque_random role fills the seed.
+finish() has two phases, both rebuilt every Finish (fresh zeroed memory):
+  1. BUILD (cheap, sequential): next[i] = (a*i + c) mod N written for i=0..N in
+     order. With N a power of two, a ≡ 1 (mod 4) and a != 1, and c odd, this is a
+     full-period LCG — a single cycle covering every node — and the writes are a
+     sequential, prefetchable pass, so the build is cheap and does NOT dominate.
+     (This replaces an earlier Sattolo shuffle whose random-index swaps were
+     themselves random-access and buried the chase; see NOTES 2026-10-01.)
+  2. CHASE (the measurement): cur = next[cur], T times. full_footprint uses T = N
+     (one pass, every load a fresh line); L1_resident uses T >> N (warm passes).
+a and c are seeded from a 32-byte opaque_random slot the patcher rewrites every
+EscrowCreate, so each cycle gets a fresh cycle order (defeats cross-Finish address
+learning). No new patcher role. a != 1 keeps the chase non-constant-stride so the
+hardware stride prefetcher can't follow it; the load is data-dependent regardless.
 
-Fuel note (wasmi 2.0.0, 1 fuel/operator): ~78 fuel per node (fill+Sattolo+one
-traverse step), so N is gas-bounded to ~12K nodes under the 1M ceiling; that is
-why full_footprint tops out sub-MB. Gas allowance is set to the 1M ceiling so the
-loop runs as long as possible; WASM_TIMING time= (not gas) is the measurement.
+Gas allowance is the 1M ceiling (chase as long as possible); WASM_TIMING time= is
+the measurement, not gas. N must be a power of two (the mod becomes a mask).
 
     python3 gen_cache_miss_chain.py
 """
@@ -45,11 +43,15 @@ HERE = Path(__file__).resolve().parent
 BASE = 64          # chain array starts here (past the 32-byte seed slot at 0)
 WASM_PAGE = 65536
 
-# name -> (N nodes, STRIDE bytes/node, T traversal steps, 32-byte magic prefix)
+# name -> (N nodes [power of 2], STRIDE bytes/node, T traversal steps, magic)
+# Both chase T=16384 times (so time difference = per-load latency difference, not
+# count). L1 wraps its 2048-node 8 KB set (warm, L1); full does one cold pass over
+# 16384 nodes at 64 B stride = 1 MB footprint. ~16.4 gas/iteration measured, so
+# build+chase stays well under the 1M ceiling (L1 ~0.30M, full ~0.54M).
 PRESETS = {
-    "chain_L1_resident":    dict(N=2048,  STRIDE=4,  T=50000,
+    "chain_L1_resident":    dict(N=2048,  STRIDE=4,  T=16384,
                                  magic=[0xC4, 0x11, 0x00, 0x01]),
-    "chain_full_footprint": dict(N=10000, STRIDE=64, T=10000,
+    "chain_full_footprint": dict(N=16384, STRIDE=64, T=16384,
                                  magic=[0xC4, 0x11, 0xFF, 0x01]),
 }
 
@@ -63,59 +65,40 @@ def addr(idx_expr: str, stride: int) -> str:
             f"(i32.mul {idx_expr} (i32.const {stride})))")
 
 
-def rng_update() -> str:
-    # xorshift32: x^=x<<13; x^=x>>17; x^=x<<5
-    return (
-        "    (local.set $rng (i32.xor (local.get $rng) "
-        "(i32.shl (local.get $rng) (i32.const 13))))\n"
-        "    (local.set $rng (i32.xor (local.get $rng) "
-        "(i32.shr_u (local.get $rng) (i32.const 17))))\n"
-        "    (local.set $rng (i32.xor (local.get $rng) "
-        "(i32.shl (local.get $rng) (i32.const 5))))\n"
-    )
-
-
 def build_wat(name: str, N: int, STRIDE: int, T: int, magic: list[int]) -> str:
+    assert N & (N - 1) == 0, "N must be a power of two (mod becomes a mask)"
     sentinel = bytes(magic) + bytes(range(28))          # 32-byte seed slot
     pages = (BASE + N * STRIDE + WASM_PAGE - 1) // WASM_PAGE
     footprint = N * STRIDE
+    mask = N - 1
     return (
         f";; {name} — GENERATED by gen_cache_miss_chain.py; do not edit.\n"
-        f";; dependent pointer-chase over a Sattolo single-cycle permutation.\n"
+        f";; dependent pointer-chase over a full-period LCG single cycle.\n"
         f";; N={N} nodes, stride={STRIDE} B (footprint {footprint} B), traverse {T}x.\n"
-        ";; Phases in finish: identity fill -> Sattolo shuffle -> chase (see gen).\n"
+        ";; Phase 1 sequential LCG build next[i]=(a*i+c)&mask; phase 2 chases it.\n"
         ";; Lifecycle: finish_removes (+accumulate)   Purpose: dos   Gas: 1000000\n"
         ";; Expected EscrowFinish: tesSUCCESS. Measure time=/gas (memory-hierarchy).\n"
-        ";; 32-byte opaque_random seed slot at offset 0 (fresh permutation/cycle).\n"
+        ";; 32-byte opaque_random seed slot at offset 0 (fresh a,c each cycle).\n"
         "(module\n"
         f"  (memory {pages})\n"
         f'  (data (i32.const 0) "{wat_bytes(sentinel)}")\n'
         '  (func (export "escrow_finish") (result i32)\n'
-        "    (local $rng i32) (local $i i32) (local $j i32)\n"
-        "    (local $cur i32) (local $tmp i32) (local $ai i32) (local $aj i32)\n"
-        "    ;; seed xorshift from the patched slot; force nonzero\n"
-        "    (local.set $rng (i32.or (i32.load (i32.const 0)) (i32.const 1)))\n"
-        "    ;; phase 1: identity fill p[i]=i\n"
+        "    (local $a i32) (local $c i32) (local $i i32) (local $cur i32)\n"
+        "    ;; a = seed[0] with a==1 (mod 4) and a!=1; c = seed[4] | 1 (odd)\n"
+        "    (local.set $a (i32.or (i32.and (i32.load (i32.const 0)) "
+        "(i32.const 0xfffffffc)) (i32.const 1)))\n"
+        "    (if (i32.eq (local.get $a) (i32.const 1)) "
+        "(then (local.set $a (i32.const 5))))\n"
+        "    (local.set $c (i32.or (i32.load (i32.const 4)) (i32.const 1)))\n"
+        "    ;; phase 1: sequential build next[i] = (a*i + c) & mask\n"
         "    (local.set $i (i32.const 0))\n"
-        "    (loop $init\n"
-        f"      (i32.store {addr('(local.get $i)', STRIDE)} (local.get $i))\n"
+        "    (loop $build\n"
+        f"      (i32.store {addr('(local.get $i)', STRIDE)}\n"
+        "        (i32.and (i32.add (i32.mul (local.get $a) (local.get $i)) "
+        f"(local.get $c)) (i32.const {mask})))\n"
         "      (local.set $i (i32.add (local.get $i) (i32.const 1)))\n"
-        f"      (br_if $init (i32.lt_u (local.get $i) (i32.const {N}))))\n"
-        "    ;; phase 2: Sattolo shuffle -> a single random n-cycle\n"
-        f"    (local.set $i (i32.const {N - 1}))\n"
-        "    (block $done\n"
-        "      (loop $sat\n"
-        "        (br_if $done (i32.eqz (local.get $i)))\n"
-        + rng_update()
-        + "        (local.set $j (i32.rem_u (local.get $rng) (local.get $i)))\n"
-        f"        (local.set $ai {addr('(local.get $i)', STRIDE)})\n"
-        f"        (local.set $aj {addr('(local.get $j)', STRIDE)})\n"
-        "        (local.set $tmp (i32.load (local.get $ai)))\n"
-        "        (i32.store (local.get $ai) (i32.load (local.get $aj)))\n"
-        "        (i32.store (local.get $aj) (local.get $tmp))\n"
-        "        (local.set $i (i32.sub (local.get $i) (i32.const 1)))\n"
-        "        (br $sat)))\n"
-        "    ;; phase 3: dependent chase, T steps from node 0\n"
+        f"      (br_if $build (i32.lt_u (local.get $i) (i32.const {N}))))\n"
+        "    ;; phase 2: dependent chase, T steps from node 0\n"
         "    (local.set $cur (i32.const 0))\n"
         "    (local.set $i (i32.const 0))\n"
         "    (loop $trav\n"

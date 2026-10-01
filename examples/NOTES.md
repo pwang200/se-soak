@@ -692,11 +692,22 @@ attack, but per-function-entry cost (first-call translation + frame setup) is st
 strongly underbilled in the regime the guard allows. (Single-shot, floor-
 contaminated, both passes pooled; a short trial run will tighten it.)
 
-OPEN — chain pair shows NO memory-hierarchy signal. chain_L1_resident (~8 KB) and
-chain_full_footprint (~640 KB) finished in ~3914 vs ~3907 us — essentially equal
-despite the 80x working-set difference. The Sattolo build (identity + random-swap,
-itself random-access) dominates the ~3900 us and buries the chase; both footprints
-are also small enough to stay fast. Gas is near the 1M ceiling (L1 942K). The chain
-family needs rework before it yields the L1-vs-full ratio (candidates: cheaper
-single-cycle construction so the chase dominates, larger footprint, or split
-build/chase into separate measured categories). Deferred — discuss.
+RESOLVED (same day) — chain pair reworked from Sattolo to a cheap LCG build.
+First symptom: chain_L1_resident (~8 KB) and chain_full_footprint (~640 KB)
+finished in ~3914 vs ~3907 us — essentially equal despite the 80x working-set
+difference. Cause: the Sattolo build (identity + N random-index swaps, itself
+random-access) dominated the ~3900 us and buried the chase. Fix: replace Sattolo
+with a full-period LCG single cycle, next[i] = (a*i + c) mod N (N a power of two,
+a == 1 mod 4 and a != 1, c odd; a,c from the opaque_random seed). The build is now
+a SEQUENTIAL (prefetchable, near-free) write pass, so the random chase dominates.
+Verified single-cycle over 200 seeds offline. Resized so both chase T=16384 loads
+(same count -> time difference is per-load latency): L1 N=2048 stride=4 (8 KB,
+warm, ~8 passes), full N=16384 stride=64 (1 MB, one cold pass). First attempt
+(N=32768 full, T=32768) OOG'd — measured ~16.4 gas/loop iteration, so 2N=65536
+iters x 16.4 > 1M; N=16384 keeps build+chase ~537K, safe. Live single-shot
+(2026-10-01): L1 308,143 gas / 794 us; full 623,563 gas / 2,937 us -> 3.7x time
+ratio at equal chase count = the memory-hierarchy signal. gen_cache_miss_chain.py
+now emits the LCG build (the 2026-09-21 Sattolo description above is historical).
+Caveat: full also does more build writes (higher gas), but the build is sequential
+and fast so the 3.7x is chase-dominated; ledger_seq/open flags will let a trial run
+isolate the consensus pass cleanly.

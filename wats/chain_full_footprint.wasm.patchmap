@@ -1,10 +1,10 @@
 {
   "template": "chain_full_footprint",
-  "length": 299,
+  "length": 224,
   "slots": [
     {
       "name": "seed",
-      "offset": 267,
+      "offset": 192,
       "length": 32,
       "role": "opaque_random",
       "params": {}

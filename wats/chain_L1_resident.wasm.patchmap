@@ -1,10 +1,10 @@
 {
   "template": "chain_L1_resident",
-  "length": 293,
+  "length": 220,
   "slots": [
     {
       "name": "seed",
-      "offset": 261,
+      "offset": 188,
       "length": 32,
       "role": "opaque_random",
       "params": {}

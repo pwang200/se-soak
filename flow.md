@@ -387,42 +387,46 @@ WASM_TIMING_FINISH does **not** split instantiate from execute time (one combine
 
 **dos_cache_miss_chain family** (two presets: chain_L1_resident,
 chain_full_footprint). A data-dependent pointer chase — the strongest known
-pure-wasm DoS shape. finish builds a random permutation in linear memory and then
-follows it, so each load's address comes from the previous load: no prefetch, no
-memory-level parallelism, cost set by the memory-hierarchy level the working set
-lands in. Three phases, all rebuilt every Finish (fresh zeroed memory): identity
-fill `p[i]=i`, a Sattolo shuffle into a single random n-cycle (so one pass visits
-every node once), then the chase. The xorshift32 seed is a 32-byte
-`opaque_random` slot the patcher rewrites per cycle, so every Finish gets a fresh
-permutation — no new patcher role.
+pure-wasm DoS shape. finish builds a single-cycle permutation in linear memory and
+then follows it, so each load's address comes from the previous load: no prefetch,
+no memory-level parallelism, cost set by the memory-hierarchy level the working set
+lands in. Two phases, rebuilt every Finish (fresh zeroed memory): a cheap
+SEQUENTIAL build of a full-period LCG single cycle (`next[i] = (a*i + c) mod N`
+written in order, N a power of two, a ≡ 1 mod 4 and a ≠ 1, c odd), then the random
+chase. a and c come from a 32-byte `opaque_random` seed the patcher rewrites per
+cycle, so every Finish gets a fresh cycle order — no new patcher role. (An earlier
+version used a Sattolo shuffle; its random-index swaps were themselves
+random-access and dominated the wall time, hiding the chase — see NOTES
+2026-10-01. The sequential LCG build is near-free, so the chase dominates.)
 
-| preset | nodes × stride | footprint | traversal | probes |
+| preset | nodes × stride | footprint | chase | probes |
 |---|---|---|---|---|
-| chain_L1_resident | 2048 × 4 B | ~8 KB | many passes (T=50000) | warm-cache floor (stays in L1 on both hosts) |
-| chain_full_footprint | 10000 × 64 B | ~0.6 MB | one pass (T=N) | largest working set the gas ceiling allows |
+| chain_L1_resident | 2048 × 4 B | ~8 KB | T=16384 (warm, ~8 passes) | warm-cache floor (L1 on both hosts) |
+| chain_full_footprint | 16384 × 64 B | ~1 MB | T=16384 (one cold pass) | cold working set the gas ceiling allows |
 
-Naming is by shape, not cache level: on the test hosts (M4 Pro ~24 MB L3,
-Threadripper 9960X ~128 MB L3) chain_full_footprint's ~0.6 MB is an L2/LLC chase,
-**not** DRAM-evicting. That is a finding, not a limitation of the code: wasmi
-charges 1 fuel per operator and forbids bulk memory, so building the array costs
-~78 fuel per node (identity + Sattolo + one chase step), which caps the buildable
-working set at ~12,000 nodes under the 1M gas ceiling — well below any modern LLC.
-So the ~8.9 ns/gas DRAM shape from the earlier session is effectively unreachable
-on this build: the attacker cannot afford the memory to make it work (see NOTES
-"cache-miss chain" for the full argument and the open question about that
-measurement). The L1-vs-full ratio still quantifies how much the memory hierarchy
-matters here. Gas is at the 1M ceiling so the chase runs as long as possible;
-WASM_TIMING `time=` is the measurement, not gas. Blobs are ~300 bytes (the array
-is built at runtime, not shipped), so Create fees are ~1,600 drops.
+Both chase the same 16,384 loads, so the time difference is per-load latency, not
+count. Live single-shot (2026-10-01): L1 794 µs vs full 2,937 µs, a **3.7x** ratio
+— the memory-hierarchy signal. Naming is by shape, not cache level: on the test
+hosts (M4 Pro ~16 MB L2, Threadripper 9960X 1 MB L2 / 128 MB L3) full's ~1 MB is an
+L2/L3 chase, **not** DRAM-evicting. That bound is itself a finding: wasmi charges
+~16 gas per loop iteration (1 fuel/operator) and forbids bulk memory, so
+build + chase caps the buildable working set near 30K nodes (~2 MB) under the 1M
+gas ceiling — below any modern LLC. So the ~8.9 ns/gas DRAM shape from the earlier
+session is effectively unreachable on this build: the attacker cannot afford the
+memory to make it work (see NOTES "cache-miss chain"). Gas is at the 1M ceiling;
+WASM_TIMING `time=` is the measurement, not gas. Blobs are ~220 bytes (the array
+is built at runtime, not shipped), so Create fees are ~1,200 drops.
 
-Twenty of the twenty-eight behave as intended and are confirmed live. Two earlier
-issues were resolved: oog_compile runs out of translation fuel (§6), and
-update_data_then_success converges once its home_le_field field code was
-corrected (§6). The three dos_large_finish, three dos_expensive_instantiation, and
-two dos_cache_miss_chain cases are **staged, not yet run live** — they build,
-validate, and patch offline (the chase's single-cycle Sattolo and tesSUCCESS
-return are confirmed against a Python reference of the same algorithm), but the
-cost measurements and any gas recalibration wait for the updated xrpld binary.
+All twenty-eight behave as intended. Two earlier issues were resolved: oog_compile
+runs out of translation fuel (§6), and update_data_then_success converges once its
+home_le_field field code was corrected (§6). The eight DoS cases
+(dos_large_finish ×3, dos_expensive_instantiation ×3, dos_cache_miss_chain ×2) are
+now **single-shot confirmed live** against the Oct 1 release build: each returns
+tesSUCCESS with its staged gas, except that many_helpers first hit the xrpld
+min-40-bytes/function guard (reworked, above) and the chain pair was reworked from
+Sattolo to the LCG build to surface the hierarchy signal. Full trial measurements
+(stable medians, ranking vs the 8.9 ns/gas anchor, gas recalibration from the
+max-headroom staging values) are the next step; see NOTES 2026-10-01.
 
 ## 6. Known limitations / open questions
 
