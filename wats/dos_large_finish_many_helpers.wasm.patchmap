@@ -1,10 +1,10 @@
 {
   "template": "dos_large_finish_many_helpers",
-  "length": 49971,
+  "length": 18475,
   "slots": [
     {
       "name": "pad",
-      "offset": 49939,
+      "offset": 18443,
       "length": 32,
       "role": "opaque_random",
       "params": {}

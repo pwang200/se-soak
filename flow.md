@@ -317,7 +317,7 @@ holding the others roughly constant:
 |---|---|---|---|---|
 | linear | one huge finish body, COUNT straight-line `(i32.const 1)(i32.add)` units, no loop | per-instruction (translate + execute), summed | all COUNT units, once | all COUNT units, once |
 | looped | small body of BODY_UNITS units in a loop of ITERS (executed ≈ linear's COUNT) | per-executed-instruction, translation amortized | body once | body × ITERS |
-| many_helpers | finish calls N tiny one-instruction helpers once each | per-function-entry setup, called N times | N tiny bodies, once each | N entries + N tiny bodies |
+| many_helpers | finish calls N helpers once each, summing; each helper = HELPER_UNITS of linear's unit so body work matches linear | per-function-entry setup (the gap vs linear) | N helper bodies, once each | N entries + N helper bodies |
 
 The read (all vs the ~8.9 ns/gas anchor in NOTES): linear elevated but looped
 not → translation-dominant per-instruction cost; looped elevated →
@@ -333,9 +333,24 @@ costs zero fuel, so the pad does not touch the time/gas measurement. Gas is set
 to the GasLimit max (1,000,000) for staging headroom — translation cost is not
 yet measured — and should be recalibrated down to ~10× measured gas after the
 first live run. Default sizes: linear COUNT=5000 (~15 KB), looped ITERS=100 ×
-BODY_UNITS=50 (~0.5 KB), many_helpers N=5000 (~50 KB); all comfortably under the
-100 KB BytecodeSizeLimit. linear and many_helpers are size-capped by the byte
-limit; looped is capped only by gas.
+BODY_UNITS=50 (~0.5 KB), many_helpers N_HELPERS=250 × HELPER_UNITS=20 (~18 KB, so
+its 5000 body units match linear's); all comfortably under the 100 KB
+BytecodeSizeLimit. linear is size-capped by the byte limit; looped is capped only
+by gas.
+
+**many_helpers hits an xrpld defense (found live 2026-10-01).** The node rejects
+a module whose average code-bytes-per-function is below 40 once total function
+bytes exceed 1000 (`AvgBytesPerFunctionLimit{req_funcs_bytes:1000,
+min_avg_bytes_per_function:40}` at crates/xrpl-wasm-vm/src/vm.rs) — a defense
+against exactly the many-tiny-functions translation-cost attack. The first
+version used 5000 one-instruction helpers (avg 8 bytes) and was rejected
+temINVALID_BYTECODE. The rework uses 250 helpers of 20 units each (~62 B/body,
+avg ~72 B/function), which clears the guard and keeps body work matched to linear.
+Single-shot result: linear 115,030 gas / ~838 µs vs many_helpers 136,671 gas /
+~1,662 µs, so the 250 entries add ~824 µs for ~21,641 gas — about 3.3 µs and
+87 gas per entry, ~38 ns/gas on the delta, the sharpest underbilled dimension
+found (well above the 8.9 anchor). So the guard bounds the attack, but within the
+regime it allows, per-function-entry cost is still strongly underbilled.
 
 **dos_expensive_instantiation family** (three templates: inst_data, inst_elem,
 inst_locals). Where dos_large_finish probes translation and execution, this trio

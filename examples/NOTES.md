@@ -641,3 +641,62 @@ chase); or a different fuel/gas mapping. Worth reconciling before treating 8.9 a
 a target for this build. For our hosts, expect chain_full_footprint well below 8.9
 ns/gas and chain_L1_resident far below that (the floor); the L1-vs-full ratio is
 the deliverable, and the absolute confirmation waits for the live run.
+
+First live measurements (2026-10-01, Oct 1 release build @ rippled HEAD b545391d0c,
+WASM_TIMING patch; node repointed to cmake-build-release/xrpld):
+Environment confirmed: node up on the new binary, fee params present (GasLimit 1M,
+GasPrice 1M, BytecodeSizeLimit 100K, base 10), 20 pool accounts refunded on the
+fresh chain, ledger ticker advancing.
+
+WASM_TIMING_FINISH is logged TWICE per EscrowFinish tx (confirmed by pwang): xrpld
+applies the tx once against the OPEN ledger (to judge whether it's good) and again
+AFTER consensus (to build the next ledger). Both run the wasm, so two lines. For
+return_1 the two are equal (~141 and ~137 us), so the earlier 935 us was just the
+first-ever finish (cold start). Analysis joins by tx hash and currently pools both
+passes (median). PENDING (pwang): add ledger_seq and an open flag to the
+WASM_TIMING_FINISH line so the open-ledger check and the consensus build can be
+separated (pick one as canonical, or sum both for true per-tx node cost).
+
+Baseline return_1 (serial, 4 threads, 5 min, 152 cycles, 0 unexpected): gas=30
+constant; finish time median 138 us (min 38, p90 277, max 427). KEY: there is a
+~140 us FIXED per-finish-invocation overhead (instantiate + compile + apply
+machinery) independent of work done. Every measurement reads against this floor.
+time/gas is only meaningful when gas is large; for small-gas cases (inst_*) the
+signal is ABSOLUTE time above the floor, not time/gas.
+
+Single-shot DoS gate (one create+finish each): 7 of 8 run tesSUCCESS with my
+staged gas; results (gas / time_us, pooled 2 passes):
+  dos_large_finish_looped        23,520 /  267   (~11 ns/gas, above anchor)
+  dos_large_finish_linear       115,030 /  838   (~7 ns/gas)
+  inst_data                          30 /  231   (floor; signal is absolute time)
+  inst_elem                          30 /  303
+  inst_locals                        58 /  330
+  chain_full_footprint          851,487 / 3907   (~4.6 ns/gas)
+  chain_L1_resident             942,757 / 3914   (~4.2 ns/gas)
+  dos_large_finish_many_helpers  REJECTED at create (see guard below), now reworked
+
+xrpld GUARD — min average bytes per function = 40 (found live). The node rejects a
+module whose average code-bytes/function < 40 once total function bytes exceed
+1000: AvgBytesPerFunctionLimit{req_funcs_bytes:1000, min_avg_bytes_per_function:40}
+at crates/xrpl-wasm-vm/src/vm.rs; log "wasm: compile: the Wasm module failed to
+meet the minimum average bytes per function of 40: avg=8, ter: temINVALID_BYTECODE".
+A defense against exactly the many-tiny-functions translation-cost attack. The
+original dos_large_finish_many_helpers (5000 one-instruction helpers, avg 8 B) was
+blocked. REWORKED to 250 helpers x 20 (i32.const 1)(i32.add) units (~72 B avg/func,
+clears the guard; 5000 body units match dos_large_finish_linear). Re-run single
+shot: create tesSUCCESS, finish tesSUCCESS, gas=136,671 time~1662 us. Differential
+vs linear (115,030 / ~838) = 250 entries add ~824 us for ~21,641 gas = ~3.3 us and
+~87 gas per entry = ~38 ns/gas on the delta — the SHARPEST underbilled dimension
+found, well above the 8.9 anchor. So: the guard bounds the many-tiny-functions
+attack, but per-function-entry cost (first-call translation + frame setup) is still
+strongly underbilled in the regime the guard allows. (Single-shot, floor-
+contaminated, both passes pooled; a short trial run will tighten it.)
+
+OPEN — chain pair shows NO memory-hierarchy signal. chain_L1_resident (~8 KB) and
+chain_full_footprint (~640 KB) finished in ~3914 vs ~3907 us — essentially equal
+despite the 80x working-set difference. The Sattolo build (identity + random-swap,
+itself random-access) dominates the ~3900 us and buries the chase; both footprints
+are also small enough to stay fast. Gas is near the 1M ceiling (L1 942K). The chain
+family needs rework before it yields the L1-vs-full ratio (candidates: cheaper
+single-cycle construction so the chase dominates, larger footprint, or split
+build/chase into separate measured categories). Deferred — discuss.
