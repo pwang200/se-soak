@@ -5,6 +5,24 @@ se-soak repo but NONE of the chat context it was written in; everything it needs
 in the repo. Goal: run the smart-escrow memory-leak soak and report whether
 xrpld's smart-escrow Finish path leaks memory.
 
+## Box setup (one-time, human, before starting the session)
+The git repo has all the code, `wats/*.wasm`, docs, and `requirements.txt`. Only
+one file lives outside it, and a few things regenerate on the box:
+1. Clone the repo. Build xrpld with the WASM_TIMING patch; confirm
+   `grep -c WASM_TIMING_FINISH <binary>` > 0 and a finish log line carries
+   `ledger_seq=` and `open=`.
+2. Copy `xrpld.cfg` onto the box and edit its three absolute paths for this
+   machine: `[node_db]` path, `[database_path]`, `[debug_logfile]`. Keep the
+   `[features]` block exactly as is (SmartEscrow, Escrow, NonFungibleTokensV1_1,
+   MPTokensV1, PriceOracle, Credentials) — standalone needs it or smart escrows
+   silently don't work.
+3. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
+4. Do NOT copy `test_accounts.json` (regenerate with `setup_accounts.py` on the
+   fresh chain), `.venv` (recreate), or `populated/` (not needed for the leak
+   soak). The committed `wats/*.wasm` come with the clone, no wat2wasm needed.
+Then start xrpld standalone and hand the prompt below to a Claude Code session
+opened in the repo.
+
 ---
 
 You are running on a Ubuntu box in the `se-soak` repo with no prior context. Your
