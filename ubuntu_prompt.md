@@ -9,19 +9,25 @@ xrpld's smart-escrow Finish path leaks memory.
 The git repo has all the code, `wats/*.wasm`, docs, and `requirements.txt`. Only
 one file lives outside it, and a few things regenerate on the box:
 1. Clone the repo. Build xrpld with the WASM_TIMING patch; confirm
-   `grep -c WASM_TIMING_FINISH <binary>` > 0 and a finish log line carries
-   `ledger_seq=` and `open=`.
+   `grep -a -c WASM_TIMING_FINISH <binary>` > 0 (plain `grep -c` reports 0 on a
+   binary) and a finish log line carries `ledger_seq=` and `open=`.
 2. Copy `xrpld.cfg` onto the box and edit its three absolute paths for this
    machine: `[node_db]` path, `[database_path]`, `[debug_logfile]`. Keep the
    `[features]` block exactly as is (SmartEscrow, Escrow, NonFungibleTokensV1_1,
    MPTokensV1, PriceOracle, Credentials) — standalone needs it or smart escrows
    silently don't work.
-3. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`.
+3. `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` — with the
+   host's python3, run from a normal terminal or an unsandboxed IDE (a Flatpak
+   PyCharm hides host processes, so the sampler cannot see xrpld, and its venv
+   will not load on the host).
 4. Do NOT copy `test_accounts.json` (regenerate with `setup_accounts.py` on the
    fresh chain), `.venv` (recreate), or `populated/` (not needed for the leak
    soak). The committed `wats/*.wasm` come with the clone, no wat2wasm needed.
-Then start xrpld standalone and hand the prompt below to a Claude Code session
-opened in the repo.
+5. Start xrpld standalone from its run dir. **On every fresh `--start`, `rm -rf` the
+   `db/` folder first** — `db/state.db` keeps the old chain's online_delete rotation
+   point, so a reused db will not rotate until that ledger +512 (see flow.md §7).
+   A fresh chain also needs `setup_accounts.py` again.
+Then hand the prompt below to a Claude Code session opened in the repo.
 
 ---
 
@@ -43,7 +49,7 @@ job is to run the smart-escrow memory-leak soak and report a verdict.
 - A Python venv built from `requirements.txt` (xrpl-py, psutil). Use it for every
   `python3` call. The committed `wats/*.wasm` are used as-is (no wabt needed).
 - Confirm before starting: `server_info` shows the node up and fee params present
-  (GasLimit/GasPrice/BytecodeSizeLimit); `grep -c WASM_TIMING_FINISH <binary>` > 0
+  (GasLimit/GasPrice/BytecodeSizeLimit); `grep -a -c WASM_TIMING_FINISH <binary>` > 0
   and a finish log line carries `ledger_seq=` and `open=`; the pool is funded
   (`setup_accounts.py --count 500` if the chain is fresh).
 
@@ -55,14 +61,19 @@ builds and did NOT on the 2026-10-01 build, so it must be checked per-binary.
 3. Check `server_info.complete_ledgers`: the earliest must advance past 2
    (e.g. "600-1100"), and the log must show `SHAMapStore ... finished rotation`.
 - Rotates → proceed to Step 1, and note the first ledger_seq retained after
-  rotation (you pass it to `analyze_leak --warmup-ledgers`).
+  rotation (you pass it to `analyze_leak --warmup-ledgers`). If it does not rotate
+  and `<run_data>/db/state.db` (`DbState.LastRotatedLedger`) is higher than the
+  current ledger, the db is stale: stop xrpld, wipe `db/`, restart (not a build bug).
 - Does NOT rotate after ~1,100 ledgers at normal pace → STOP and report. The
   plateau method won't work; use the empty-ledger control fallback in flow.md §7,
   or get rotation working first.
 
 ## Step 1 — baseline leak soak (trivial wasm)
 Each long-running piece in tmux/nohup (a real soak is hours; your box has no time
-cap). Keep the Step 0 ticker running.
+cap). Keep the Step 0 ticker running. The sampler finds xrpld by itself (Linux's
+process name is `xrpld-main`; it matches `xrpld-main`, `xrpld`, `rippled`).
+For unattended runs prefer `scripts/soak_supervisor.py` (restarts the ticker/sampler,
+health-checks, writes STATUS.txt; see flow.md §7) over the bare commands below.
 ```
 python3 scripts/rippled_memory_sampler.py --interval 1 \
     --output runs/leak_return1/xrpld_memory.csv
@@ -74,6 +85,7 @@ Start with 2 h (`--duration 7200`); extend to 6 h (`21600`) if inconclusive. The
 ```
 python3 analyze_leak.py runs/leak_return1 --warmup-ledgers <first seq after rotation> --windows 8
 ```
+`analyze_leak.py` clips to the load window (so a sampler idle tail does not skew the slope).
 
 ## Step 2 — heavy soak (isolate a wasm-teardown leak)
 Repeat Step 1 with `--categories chain_full_footprint` (and/or `inst_data`) into a

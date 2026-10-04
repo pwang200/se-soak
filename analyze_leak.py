@@ -20,6 +20,13 @@ Why a verdict needs care (read before trusting the number):
     at the same ledger rate: the leak is the DIFFERENCE in bytes-per-ledger, not the
     raw slope. See the "Leak soak" section of flow.md.
 
+The sampler usually keeps running after the load stops (an idle tail), and an idle
+node releases memory, which would drag the slope negative. So by default the
+analysis is CLIPPED to the load window: from <run-dir>/events.csv (supervisor runs:
+first segment_start .. idle_tail_start / last segment_end) if present, else from the
+first to the last row of soak.csv. Use --no-clip to analyze every sample.
+A supervisor run dir has no top-level soak.csv; its seg*/soak.csv files are used.
+
 Usage:
     python3 analyze_leak.py runs/<run-dir>
     python3 analyze_leak.py runs/<run-dir> --warmup-ledgers 1100   # drop pre-rotation
@@ -29,8 +36,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -98,6 +106,54 @@ def drain_baselines(log_path: Path, mem: list) -> list[tuple[int, float, int]]:
     return out
 
 
+def _last_line(path: Path) -> str:
+    """Last non-empty line of a (possibly huge) text file without reading it all."""
+    with open(path, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        block = min(size, 65536)
+        f.seek(size - block)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+    return next((l for l in reversed(lines) if l.strip()), "")
+
+
+def soak_span(paths: list[Path]) -> tuple[float, float] | None:
+    """(first, last) row timestamp across soak.csv files, or None."""
+    lo, hi = None, None
+    for p in paths:
+        try:
+            with open(p) as f:
+                f.readline()
+                first = f.readline()
+            t0 = datetime.fromisoformat(first.split(",")[0]).timestamp()
+            t1 = datetime.fromisoformat(_last_line(p).split(",")[0]).timestamp()
+        except Exception:
+            continue
+        lo = t0 if lo is None else min(lo, t0)
+        hi = t1 if hi is None else max(hi, t1)
+    return (lo, hi) if lo is not None else None
+
+
+def events_window(path: Path) -> tuple[float, float] | None:
+    """Load window from a supervisor events.csv: first segment_start to the
+    idle_tail_start (or the last segment_end)."""
+    if not path.exists():
+        return None
+    starts, ends, tail = [], [], None
+    for r in csv.DictReader(open(path)):
+        t = float(r["ts_epoch"])
+        if r["event"] == "segment_start":
+            starts.append(t)
+        elif r["event"] == "segment_end":
+            ends.append(t)
+        elif r["event"] == "idle_tail_start" and tail is None:
+            tail = t
+    if not starts:
+        return None
+    end = tail if tail is not None else (max(ends) if ends else None)
+    return (min(starts), end) if end else None
+
+
 MB = 1048576
 
 
@@ -112,6 +168,9 @@ def main() -> None:
                     help="Drop samples at/below this ledger_seq (pre-rotation ramp).")
     ap.add_argument("--warmup-s", type=float, default=0.0,
                     help="Drop the first N seconds (alternative to --warmup-ledgers).")
+    ap.add_argument("--no-clip", action="store_true",
+                    help="Do not clip samples to the load window (events.csv / "
+                         "soak.csv span); analyze everything the sampler recorded.")
     ap.add_argument("--windows", type=int, default=5,
                     help="Split the steady region into N windows to see if the slope "
                          "is decelerating (plateau) or steady (leak).")
@@ -122,8 +181,12 @@ def main() -> None:
         mem_p = Path(args.mem) if args.mem else d / "xrpld_memory.csv"
         log_p = Path(args.log) if args.log else d / "run_soak.log"
         soak_p = Path(args.soak) if args.soak else d / "soak.csv"
+        events_p = d / "events.csv"
     else:
         mem_p, log_p, soak_p = Path(args.mem), Path(args.log), Path(args.soak)
+        events_p = mem_p.parent / "events.csv"
+    # Supervisor run dir: no top-level soak.csv, the segments each have one.
+    soak_paths = [soak_p] if soak_p.exists() else sorted(soak_p.parent.glob("seg*/soak.csv"))
 
     if not mem_p.exists():
         raise SystemExit(f"no memory CSV at {mem_p} (run scripts/"
@@ -131,6 +194,17 @@ def main() -> None:
     mem = load_mem(mem_p)
     if len(mem) < 3:
         raise SystemExit(f"only {len(mem)} RSS samples; need a longer run")
+
+    if not args.no_clip:
+        win = events_window(events_p) or soak_span(soak_paths)
+        if win:
+            kept = [m for m in mem if win[0] <= m[0] <= win[1] + 5]
+            fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%H:%M:%S")
+            print(f"clipped to load window {fmt(win[0])}..{fmt(win[1])} "
+                  f"({len(mem) - len(kept)} idle/other samples dropped; --no-clip to disable)")
+            mem = kept
+            if len(mem) < 3:
+                raise SystemExit("load window contains <3 RSS samples")
 
     t0 = mem[0][0]
     # Apply warmup cutoff.
@@ -151,7 +225,7 @@ def main() -> None:
           f"peak {peak/MB:.1f}  end {mem[-1][1]/MB:.1f} MB")
 
     # Finishes.
-    fin_ts = count_finishes_over_time(soak_p) if soak_p.exists() else []
+    fin_ts = sorted(t for p in soak_paths for t in count_finishes_over_time(p))
     nfin = len(fin_ts)
 
     # Steady-region slopes (after warmup).

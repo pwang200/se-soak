@@ -497,6 +497,19 @@ leak. **Verify rotation engages on your build before trusting a soak**: close pa
 Rotation was seen working on earlier builds and NOT firing on the 2026-10-01 build
 (see NOTES), so this check is mandatory per-binary.
 
+**Gotcha — wipe `db/` before every `--start`.** The SHAMapStore rotation point
+(`LastRotatedLedger`) is persisted in `<db>/state.db` and survives a `--start`, which
+begins a fresh chain at ledger 2. If the previous chain had rotated at ledger N,
+the new chain will not rotate until ledger N+512, so the gate silently fails for
+hours. Stop xrpld, `rm -rf <run_data>/db`, start it, then re-run
+`setup_accounts.py` (the old accounts are gone with the chain).
+`scripts/soak_supervisor.py` refuses to start in that state.
+
+**Process name.** On Linux xrpld's main thread is named `xrpld-main`, so the
+process is `xrpld-main` to psutil / `pgrep -x`, not `xrpld`. The sampler matches
+`xrpld-main`, `xrpld` and `rippled` by default. (Binary check: `grep -a -c
+WASM_TIMING_FINISH <binary>`; plain `grep -c` reports 0 on a binary.)
+
 **Run it** (each long-running piece in tmux/nohup; a real soak is hours):
 
 ```
@@ -530,3 +543,30 @@ to a control: run an *empty-ledger baseline* (sampler + ticker, no soak) to get
 bytes/ledger with zero txs, then the escrow soak at the same ledger rate; the leak
 is the DIFFERENCE in bytes/ledger, not the raw slope. (A no-wasm Payment control
 would be cleaner but the driver is escrow-only today.)
+
+**Unattended / multi-hour runs: `scripts/soak_supervisor.py`.** Runs bounded segments
+(each drains its escrows on exit) from a schedule (`rehearsal` = lifecycles 1,2,4,5 + baseline,
+`steady` = `return_1`, `heavysplit*` = one heavy category per segment with idle gaps), keeps the
+ticker and sampler alive, health-checks xrpld, and writes `<run>/STATUS.txt` plus
+`events.csv`. It stops (never restarts xrpld) if xrpld dies or restarts, the disk fills, rotation
+state is stale, or an account balance drops under 1000 XRP; `touch <run>/STOP` stops it after the
+current segment. Detach it so closing the IDE/terminal does not kill it and block sleep:
+`setsid nohup systemd-inhibit --what=sleep:idle --who=se-soak --why=soak .venv/bin/python -u
+scripts/soak_supervisor.py --name long1 --hours 4 --schedule rehearsal &`.
+Paths come from `$SOAK_RUN_DATA` (default `~/rippled/run_data`). `analyze_leak.py <run>` reads
+its `events.csv` and clips to the load window, so the idle tail does not skew the slope.
+Other helpers in `scripts/`: `run_case.sh` (one 5-minute case with sampler),
+`topup_accounts.py` (refill drained accounts from genesis), `tps_ramp.py` (txs/ledger ramp).
+
+**Measured on the Ubuntu box (2026-10-03/04), for planning:**
+- Throughput with the pipeline at 400 accounts x 2 in flight: 800 txs/ledger (400 Create +
+  400 Finish), ~375 tx/s at a 2.14 s ledger (~267 tx/s at 3 s); xrpld used ~0.4 core, so the
+  limit is the driver. Past ~1000 txs/ledger standalone fee escalation
+  (`minimum_txn_in_ledger_standalone`, default 1000) kicks in and `run_soak.py` aborts on
+  `terQUEUED`; raise that cfg value to measure further.
+- Fees: `chain_full_footprint` costs ~1 XRP per Finish (gas 1M x 1 drop/gas), ~1,550
+  XRP per account per hour at 400 accounts. The accumulate pattern routes all fees through
+  one owner per thread (4 accounts); size funding (`setup_accounts.py --fund-xrp`) or top up.
+- RSS (live node): light cases plateau at ~1.3-1.9 GB; `chain_full_footprint` and `trace_heavy`
+  stay near that; `inst_data` swings 7-14 GB under load and takes ~20 min to return to
+  baseline after the load stops (released, not leaked). Threads stay at 40 (brief 47-71 spikes).

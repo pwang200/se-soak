@@ -24,6 +24,7 @@ Tail it while it runs:
 
 import argparse
 import csv
+import http.client
 import json
 import os
 import signal
@@ -51,17 +52,24 @@ FIELDS = [
 ]
 
 
-def find_pid(process_name):
-    """Return PID of first matching process by name, or None.
+# On Linux xrpld renames its main thread, so the process shows up as "xrpld-main"
+# (comm), not "xrpld"; macOS reports "xrpld". Match any of these by default.
+DEFAULT_PROCESS_NAMES = ("xrpld-main", "xrpld", "rippled")
+
+
+def find_pid(process_names):
+    """Return PID of first process whose name is in process_names, or None.
 
     Rediscovering each tick is intentional: if rippled is restarted mid-soak,
     we pick up the new PID automatically; the gap shows up as
     process_not_found rows, which is useful signal.
     """
+    if isinstance(process_names, str):
+        process_names = (process_names,)
     matches = []
     for p in psutil.process_iter(["pid", "name"]):
         try:
-            if p.info["name"] == process_name:
+            if p.info["name"] in process_names:
                 matches.append(p.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -69,7 +77,7 @@ def find_pid(process_name):
         return None
     if len(matches) > 1:
         print(
-            f"[warn] {len(matches)} processes named {process_name!r}: "
+            f"[warn] {len(matches)} processes named {process_names!r}: "
             f"{matches}; using {matches[0]}",
             file=sys.stderr,
         )
@@ -96,11 +104,16 @@ def query_ledger_seq(rpc_url, timeout=2.0):
         seq = result.get("ledger_current_index")
         return int(seq) if seq is not None else None
     except (
-        urllib.error.URLError,
+        # OSError covers URLError, socket TimeoutError (xrpld can stall its RPC for
+        # seconds under heavy wasm load) and connection resets; the sampler must
+        # never die on an RPC hiccup — it records rpc_unavailable and goes on.
+        OSError,
+        http.client.HTTPException,
         json.JSONDecodeError,
         ValueError,
         TypeError,
         KeyError,
+        AttributeError,
     ):
         return None
 
@@ -109,8 +122,9 @@ def main():
     ap = argparse.ArgumentParser(description="rippled memory sampler (xplatform)")
     ap.add_argument(
         "--process-name",
-        default="xrpld",
-        help="Process name to sample (default: xrpld)",
+        default=None,
+        help="Process name to sample (default: try xrpld-main, xrpld, rippled; "
+             "Linux xrpld's main thread is named xrpld-main)",
     )
     ap.add_argument(
         "--interval",
@@ -142,6 +156,8 @@ def main():
     )
     args = ap.parse_args()
 
+    names = (args.process_name,) if args.process_name else DEFAULT_PROCESS_NAMES
+
     if args.output is None:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         runs_dir = os.path.normpath(os.path.join(
@@ -167,7 +183,7 @@ def main():
 
     print(
         f"[info] sampling every {args.interval}s, output={args.output}, "
-        f"process={args.process_name!r}, rpc={'off' if args.no_rpc else args.rpc_url}",
+        f"process={names!r}, rpc={'off' if args.no_rpc else args.rpc_url}",
         file=sys.stderr,
     )
 
@@ -195,7 +211,7 @@ def main():
             "note": "",
         }
 
-        pid = find_pid(args.process_name)
+        pid = find_pid(names)
         if pid is None:
             row["note"] = "process_not_found"
         else:
